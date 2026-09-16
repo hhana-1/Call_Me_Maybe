@@ -78,6 +78,7 @@ class TokenAwareConstrainedRouter:
         prefix_ids = _to_ids(self.llm.encode(prefix))
         candidates: dict[str, int] = {}
         for function in candidate_functions:
+            # Score the first token produced by each description after the same prefix.
             full_ids = _to_ids(self.llm.encode(prefix + function.description))
             continuation = full_ids[len(prefix_ids):]
             if continuation:
@@ -108,6 +109,7 @@ class TokenAwareConstrainedRouter:
         for name, specification in function.parameters.items():
             parameter_type = specification.get("type")
             if parameter_type == "number":
+                # Read numbers in prompt order, while ignoring digits inside words.
                 if number_index >= len(numbers):
                     raise ValueError(f"Missing number argument: {name}")
                 value = numbers[number_index]
@@ -184,6 +186,7 @@ class TokenAwareConstrainedRouter:
             raise ValueError(f"Model selected unknown function: {name}")
         if not isinstance(parameters, dict):
             raise ValueError("Model parameters must be a JSON object")
+        # Require exactly the declared parameter set; neither omissions nor extras are valid.
         expected = set(selected.parameters)
         if set(parameters) != expected:
             raise ValueError("Model parameters do not match the function schema")

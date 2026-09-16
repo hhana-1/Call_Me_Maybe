@@ -127,3 +127,22 @@ source.
 AI was used for code review, implementation suggestions, debugging, and test
 planning. All generated code must be understood, tested, and peer-reviewed
 before submission.
+
+
+
+Load function definitions and prompts.
+|
+v
+Rank candidate functions.
+|
+v
+Select a function using token logits.
+|
+v
+Extract arguments.
+|
+v
+Validate the result.
+|
+v
+Write JSON output.
