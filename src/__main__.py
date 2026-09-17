@@ -50,7 +50,7 @@ def main() -> int:
                         "response": result,
                         "started_at": response_start_time,
                         "finished_at": response_finish_time,
-                        "elapsed_minutes": round(response_elapsed_minutes, 3),
+                        "time passed": round(response_elapsed_minutes, 3),
                     },
                     indent=2,
                 ),

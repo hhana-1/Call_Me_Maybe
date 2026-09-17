@@ -22,6 +22,29 @@ FUNCTION_SCHEMAS: list[dict[str, Any]] = _load_json(
 )
 TEST_PROMPTS: list[dict[str, str]] = _load_json("function_calling_tests.json")
 
+DOMAIN_VOCABULARIES = {
+    "economy": {
+        "economy", "economic", "interest", "compound", "principal",
+        "rate", "finance", "financial", "investment", "loan",
+    },
+    "database": {
+        "sql", "query", "database", "table", "select", "insert",
+        "update", "delete", "production", "logs", "users",
+    },
+    "math": {
+        "add", "sum", "plus", "multiply", "product",
+        "square", "root", "even", "odd", "calculate",
+    },
+    "boolean": {
+        "boolean", "bool", "true", "false", "yes", "no", "whether",
+        "if", "check", "is", "flag", "enabled", "disabled",
+    },
+    "prose": {
+        "greet", "reverse", "replace", "substitute", "word", "string",
+        "format", "template", "read", "file", "vowel", "asterisk",
+    },
+}
+
 # =====================================================================
 # 2. TOKENIZATION ENGINES (Simulated & Rule-Based)
 # =====================================================================
@@ -66,6 +89,27 @@ def tokenize_custom_hybrid(text: str) -> List[str]:
 # =====================================================================
 # 3. ROUTER / SELECTOR LOGIC
 # =====================================================================
+
+def detect_domain(text: str) -> str | None:
+    """Find the first matching domain in the required priority order."""
+    words = {word.lower() for word in re.findall(r"[A-Za-z]+", text)}
+    for domain in ("economy", "database", "math", "boolean", "prose"):
+        if words & DOMAIN_VOCABULARIES[domain]:
+            return domain
+    return None
+
+def schema_domain(schema: dict[str, Any]) -> str | None:
+    """Infer a function domain from its name and description."""
+    return detect_domain(f"{schema['name']} {schema['description']}")
+
+
+def domain_vocabulary_matches(text: str) -> dict[str, set[str]]:
+    """Return vocabulary terms found in text for each domain."""
+    words = {word.lower() for word in re.findall(r"[A-Za-z]+", text)}
+    return {
+        domain: words & vocabulary
+        for domain, vocabulary in DOMAIN_VOCABULARIES.items()
+    }
 
 def choose_and_run_tokenizer(text: str, is_schema: bool = False) -> Tuple[str, List[str]]:
     """
@@ -127,6 +171,8 @@ def rank_schema_candidates(
         bool(re.fullmatch(r"-?\d+(?:\.\d+)?", token))
         for token in tokenize_custom_hybrid(prompt)
     )
+    prompt_domain = detect_domain(prompt)
+    prompt_domain_matches = domain_vocabulary_matches(prompt)
     scored: list[tuple[int, dict[str, Any]]] = []
     for schema in functions:
         description_tokens = {
@@ -148,6 +194,16 @@ def rank_schema_candidates(
             2 * len(prompt_words & schema_words)
             + len(prompt_tokens & description_tokens)
         )
+        schema_domain_matches = domain_vocabulary_matches(
+            f"{schema['name']} {schema['description']}"
+        )
+        shared_domain_terms = sum(
+            len(prompt_domain_matches[domain] & schema_domain_matches[domain])
+            for domain in DOMAIN_VOCABULARIES
+        )
+        score += 5 * shared_domain_terms
+        if prompt_domain is not None and schema_domain(schema) == prompt_domain:
+            score += 5
         numeric_parameters = sum(
             specification.get("type") == "number"
             for specification in schema.get("parameters", {}).values()

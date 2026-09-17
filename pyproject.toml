@@ -1,7 +1,7 @@
 [project]
-name = "function-calling-system"
+name = "Call-me-Maybe"
 version = "0.1.0"
-description = "Constrained function calling pipeline using Qwen"
+description = "Constrained function calling pipeline"
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0.0",

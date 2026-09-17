@@ -146,3 +146,22 @@ Validate the result.
 |
 v
 Write JSON output.
+
+
+Tokenizes the prompt.
+Finds vocabulary terms by domain.
+Tokenizes each function name and description.
+Finds vocabulary terms in each function.
+Gives points for shared domain terms.
+Adds a smaller bonus when both belong to the same domain.
+Keeps every JSON-defined function available.
+```bash
+Prompt:
+Substitute the word 'cat' with 'dog' ...
+
+Prompt vocabulary:
+prose -> substitute, word
+
+Substitution function vocabulary:
+prose -> substitute, word, string, replace
+```

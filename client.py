@@ -115,6 +115,14 @@ class TokenAwareConstrainedRouter:
                 value = numbers[number_index]
                 arguments[name] = int(value) if value.is_integer() else value
                 number_index += 1
+            elif parameter_type == "integer":
+                if number_index >= len(numbers):
+                    raise ValueError(f"Missing integer argument: {name}")
+                value = numbers[number_index]
+                if not value.is_integer():
+                    raise ValueError(f"Integer argument must be whole: {name}")
+                arguments[name] = int(value)
+                number_index += 1
             elif parameter_type == "string":
                 arguments[name] = self._string_argument(
                     prompt, name, quoted, string_index
@@ -122,13 +130,34 @@ class TokenAwareConstrainedRouter:
                 string_index += 1
             elif parameter_type == "boolean":
                 match = re.search(r"\b(true|false)\b", prompt, re.IGNORECASE)
-                if match is None:
-                    raise ValueError(f"Missing boolean argument: {name}")
-                arguments[name] = match.group(1).lower() == "true"
+                if match is not None:
+                    arguments[name] = match.group(1).lower() == "true"
+                else:
+                    math_result = self._math_boolean_result(prompt)
+                    if math_result is None:
+                        raise ValueError(f"Missing boolean argument: {name}")
+                    arguments[name] = math_result
             else:
                 raise ValueError(f"Unsupported parameter type: {parameter_type}")
 
         return arguments
+
+    @staticmethod
+    def _math_boolean_result(prompt: str) -> bool | None:
+        """Evaluate simple even/odd questions without using the model."""
+        match = re.search(
+            r"\b(?:is|are)\s+(-?\d+(?:\.\d+)?)\s+(?:a|an)\s+"
+            r"(even|odd)(?:\s+number)?\b",
+            prompt,
+            re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        value = float(match.group(1))
+        if not value.is_integer():
+            raise ValueError("Even/odd checks require an integer")
+        is_even = int(value) % 2 == 0
+        return is_even if match.group(2).lower() == "even" else not is_even
 
     @staticmethod
     def _string_argument(
@@ -155,12 +184,42 @@ class TokenAwareConstrainedRouter:
             match = re.search(r"in\s+(['\"])(.*?)\1", prompt, re.IGNORECASE)
             if match:
                 return match.group(2)
+        if name == "path":
+            path_candidates = [
+                token.strip(" '\"")
+                for token in re.findall(r"[^\s,;]+", prompt)
+                if TokenAwareConstrainedRouter._looks_like_path(token)
+            ]
+            if path_candidates:
+                return path_candidates[0]
+        if name == "encoding":
+            match = re.search(
+                r"(?:with|using)\s+([A-Za-z0-9_.-]+)\s+encoding\b|"
+                r"\bencoding\s*[:=]\s*([A-Za-z0-9_.-]+)",
+                prompt,
+                re.IGNORECASE,
+            )
+            if match:
+                return (match.group(1) or match.group(2)).lower()
         if index < len(quoted):
             return quoted[index]
         words = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", prompt)
         if not words:
             raise ValueError(f"Missing string argument: {name}")
         return words[-1]
+
+    @staticmethod
+    def _looks_like_path(value: str) -> bool:
+        """Recognize common path shapes across operating systems."""
+        return bool(
+            re.fullmatch(
+                r"(?:[A-Za-z]:[\\/][^\s,;]+|"
+                r"(?:/|\./|\.\./|~/)[^\s,;]+|"
+                r"[\w.-]+(?:[\\/][\w .-]+)+|"
+                r"[\w.-]+\.[A-Za-z0-9]+)",
+                value.strip(" '\""),
+            )
+        )
 
     def make_call(self, prompt: str, function: FunctionSchema) -> FunctionCall:
         """Build and validate the exact output contract."""
@@ -198,6 +257,10 @@ class TokenAwareConstrainedRouter:
             ) or (
                 parameter_type == "number"
                 and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            ) or (
+                parameter_type == "integer"
+                and isinstance(value, int)
                 and not isinstance(value, bool)
             ) or (parameter_type == "boolean" and isinstance(value, bool))
             if not valid:
