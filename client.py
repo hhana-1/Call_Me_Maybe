@@ -1,6 +1,7 @@
 """Function selection and schema-aware argument extraction."""
 
 import json
+import math
 import re
 from typing import Any, Protocol, Sequence
 
@@ -18,15 +19,6 @@ class ModelWrapper(Protocol):
         """Return logits for the next token."""
 
 
-class JsonModel(Protocol):
-    """Public interface for compliant structured-output model backends."""
-
-    def generate_call(
-        self, prompt: str, functions: list[FunctionSchema]
-    ) -> dict[str, Any]:
-        """Generate a schema-constrained function call."""
-
-
 def _to_ids(encoded: Any) -> list[int]:
     """Convert the SDK tensor/list result into a flat list of token ids."""
     if hasattr(encoded, "detach"):
@@ -36,11 +28,44 @@ def _to_ids(encoded: Any) -> list[int]:
     return [int(value) for value in encoded]
 
 
+def _softmax(values: dict[str, float]) -> dict[str, float]:
+    """Convert candidate logits into numerically stable probabilities."""
+    highest = max(values.values())
+    exponentials = {
+        name: math.exp(value - highest) for name, value in values.items()
+    }
+    total = sum(exponentials.values())
+    return {name: value / total for name, value in exponentials.items()}
+
+
 class TokenAwareConstrainedRouter:
     """Choose functions with model scores and validate their arguments."""
 
     def __init__(self, model_wrapper: ModelWrapper) -> None:
         self.llm = model_wrapper
+        self.function_cache: dict[str, tuple[str, int]] = {}
+
+    def _encode(self, text: str) -> list[int]:
+        """Encode text with the model SDK's real tokenizer."""
+        return _to_ids(self.llm.encode(text))
+
+    def _cache_function_definitions(
+        self, functions: Sequence[FunctionSchema]
+    ) -> None:
+        """Encode each function description once for reuse across prompts."""
+        for function in functions:
+            if function.name in self.function_cache:
+                continue
+            description_ids = self._encode(" " + function.description)
+            if description_ids:
+                definition_text = (
+                    f"- {function.name}: {function.description}; parameters: "
+                    f"{', '.join(function.parameters)}"
+                )
+                self.function_cache[function.name] = (
+                    definition_text,
+                    description_ids[0],
+                )
 
     def select_function(
         self, prompt: str, functions: Sequence[FunctionSchema]
@@ -49,6 +74,7 @@ class TokenAwareConstrainedRouter:
         if not functions:
             raise ValueError("No function definitions were provided")
 
+        self._cache_function_definitions(functions)
         raw_functions = [function.model_dump() for function in functions]
         candidate_data = rank_schema_candidates(prompt, raw_functions)
         candidate_names = {item["name"] for item in candidate_data}
@@ -58,13 +84,13 @@ class TokenAwareConstrainedRouter:
         if not candidate_functions:
             candidate_functions = list(functions)
         definitions = "\n".join(
-            f"- {function.name}: {function.description}; parameters: "
-            f"{', '.join(function.parameters)}"
+            self.function_cache[function.name][0]
             for function in candidate_functions
         )
         token_context = build_routing_context(
             prompt,
             [function.model_dump() for function in candidate_functions],
+            self.llm,
         )
         prefix = (
             "You are a function router. Choose the function that directly "
@@ -75,19 +101,20 @@ class TokenAwareConstrainedRouter:
             f"User request: {prompt}\n"
             "Best matching function description: "
         )
-        prefix_ids = _to_ids(self.llm.encode(prefix))
+        prefix_ids = self._encode(prefix)
         candidates: dict[str, int] = {}
         for function in candidate_functions:
-            # Score the first token produced by each description after the same prefix.
-            full_ids = _to_ids(self.llm.encode(prefix + function.description))
-            continuation = full_ids[len(prefix_ids):]
-            if continuation:
-                candidates[function.name] = continuation[0]
+            _, first_description_token = self.function_cache[function.name]
+            candidates[function.name] = first_description_token
 
         if not candidates:
             raise ValueError("Model could not tokenize function descriptions")
         logits = self.llm.get_logits_from_input_ids(prefix_ids)
-        best_name = max(candidates, key=lambda name: logits[candidates[name]])
+        candidate_logits = {
+            name: logits[token_id] for name, token_id in candidates.items()
+        }
+        probabilities = _softmax(candidate_logits)
+        best_name = max(probabilities, key=probabilities.get)
         return next(
             function for function in candidate_functions if function.name == best_name
         )

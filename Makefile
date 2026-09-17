@@ -4,6 +4,9 @@ install:
 run:
 	uv run python -m src
 
+export-vocabulary:
+	uv run python export_vocabulary.py
+
 debug:
 	uv run python -m pdb -m src
 

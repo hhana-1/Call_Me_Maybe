@@ -2,12 +2,6 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-class FunctionParameter(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: str
-    description: str | None = None
-
 class FunctionSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

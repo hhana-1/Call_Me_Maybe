@@ -43,7 +43,7 @@ def main() -> int:
             result = router.generate_call(prompt, functions).model_dump()
             response_finished = time.perf_counter()
             response_finish_time = time.strftime("%H:%M:%S")
-            response_elapsed_minutes = (response_finished - response_started) / 60
+            response_elapsed_minutes = (response_finished - response_started)/60
             print(
                 json.dumps(
                     {
@@ -63,7 +63,7 @@ def main() -> int:
         with output_path.open("w", encoding="utf-8") as handle:
             json.dump(results, handle, indent=2)
         total_finished = time.perf_counter()
-        total_elapsed_seconds = total_finished - total_started
+        total_elapsed_seconds = (total_finished - total_started)
         print(
             f"Total time for {len(results)} response(s): "
             f"{total_elapsed_seconds:.2f} seconds",

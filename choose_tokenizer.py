@@ -1,7 +1,7 @@
 import json
 import re
 from pathlib import Path
-from typing import Any, List, Sequence, Tuple
+from typing import Any, Sequence
 
 # =====================================================================
 # 1. DATA DEFINITIONS
@@ -20,7 +20,6 @@ def _load_json(filename: str) -> Any:
 FUNCTION_SCHEMAS: list[dict[str, Any]] = _load_json(
     "functions_definition.json"
 )
-TEST_PROMPTS: list[dict[str, str]] = _load_json("function_calling_tests.json")
 
 DOMAIN_VOCABULARIES = {
     "economy": {
@@ -46,45 +45,26 @@ DOMAIN_VOCABULARIES = {
 }
 
 # =====================================================================
-# 2. TOKENIZATION ENGINES (Simulated & Rule-Based)
+# 2. MODEL TOKENIZATION AND DOMAIN MATCHING
 # =====================================================================
 
-def tokenize_bpe(text: str) -> List[str]:
-    """Simulates BPE by breaking subwords and code structures (snake_case)."""
-    # Splitting camelCase and snake_case or punctuation
-    tokens = re.findall(r'[a-zA-Z]+|_\w+|\d+|[^\w\s]', text)
-    processed = []
-    for t in tokens:
-        if t.startswith('_'):
-            processed.extend(['_', t[1:]])
-        else:
-            processed.append(t)
-    return processed
+def tokenize_with_model(model: Any, text: str) -> tuple[list[int], list[str]]:
+    """Tokenize text with the model SDK and decode each token for display."""
+    encoded = model.encode(text)
+    if hasattr(encoded, "detach"):
+        encoded = encoded.detach().cpu().tolist()
+    while encoded and isinstance(encoded[0], list):
+        encoded = encoded[0]
+    token_ids = [int(token_id) for token_id in encoded]
+    tokens = [model.decode([token_id]) for token_id in token_ids]
+    return token_ids, tokens
 
-def tokenize_wordpiece(text: str) -> List[str]:
-    """Simulates WordPiece text chunking with wordpieces (## tokens)."""
-    # Naive split with ## appended to subsequent parts of rare terms
-    words = text.split()
-    tokens = []
-    for w in words:
-        clean = re.sub(r'[^\w]', '', w)
-        if len(clean) > 6:
-            tokens.extend([clean[:4], f"##{clean[4:]}"])
-        else:
-            tokens.append(w)
-    return tokens
-
-def tokenize_unigram(text: str) -> List[str]:
-    """Simulates Unigram behavior optimizing for full natural language words."""
-    return re.findall(r'\b\w+\b|[^\w\s]', text)
-
-def tokenize_custom_hybrid(text: str) -> List[str]:
-    """
-    Custom Hybrid Tokenizer.
-    Guarantees quoted blocks and multi-digit integers remain atomic.
-    """
-    pattern = r'(?:"[^"\\]*(?:\\.[^"\\]*)*"|\'[^\'\\]*(?:\\.[^\'\\]*)*\'|\d+|\b\w+(?:\'\w+)?\b|[^\s\w])'
-    return re.findall(pattern, text)
+def word_tokens(text: str) -> set[str]:
+    """Return normalized words for lightweight candidate scoring."""
+    return {
+        token.lower()
+        for token in re.findall(r"[A-Za-z]+", text)
+    }
 
 # =====================================================================
 # 3. ROUTER / SELECTOR LOGIC
@@ -111,43 +91,28 @@ def domain_vocabulary_matches(text: str) -> dict[str, set[str]]:
         for domain, vocabulary in DOMAIN_VOCABULARIES.items()
     }
 
-def choose_and_run_tokenizer(text: str, is_schema: bool = False) -> Tuple[str, List[str]]:
-    """
-    Inspects input structural traits and executes the absolute best 
-    tokenization algorithm for that specific payload.
-    """
-    if is_schema:
-        # Code syntax, raw strings, and regular expressions favor structural BPE
-        if "_" in text or "regex" in text.lower() or "\\" in text:
-            return "Byte-Pair Encoding (BPE)", tokenize_bpe(text)
-        return "WordPiece", tokenize_wordpiece(text)
-        
-    # Check variables inside user prompts
-    has_quotes = '"' in text or "'" in text
-    has_large_numbers = any(len(num) > 1 for num in re.findall(r'\d+', text))
-    
-    # User prompts with exact variable arguments require custom boundary protection
-    if has_quotes or has_large_numbers:
-        return "Custom Hybrid (Rule-Based)", tokenize_custom_hybrid(text)
-        
-    # Default clean natural language structures fit Unigram optimization maps
-    return "Unigram", tokenize_unigram(text)
-
-
 def build_routing_context(
-    prompt: str, functions: Sequence[dict[str, Any]] | None = None
+    prompt: str,
+    functions: Sequence[dict[str, Any]] | None = None,
+    model: Any | None = None,
 ) -> str:
-    """Build a token-aware routing context from the live JSON definitions."""
+    """Build routing context using the SDK tokenizer when a model is given."""
     schemas = list(functions) if functions is not None else FUNCTION_SCHEMAS
     lines = ["Tokenized function definitions:"]
     for schema in schemas:
-        _, description_tokens = choose_and_run_tokenizer(
-            schema["description"], is_schema=True
-        )
+        if model is not None:
+            _, description_tokens = tokenize_with_model(
+                model, schema["description"]
+            )
+        else:
+            description_tokens = sorted(word_tokens(schema["description"]))
         lines.append(
             f"{schema['name']}: {' '.join(description_tokens)}"
         )
-    _, prompt_tokens = choose_and_run_tokenizer(prompt)
+    if model is not None:
+        _, prompt_tokens = tokenize_with_model(model, prompt)
+    else:
+        prompt_tokens = sorted(word_tokens(prompt))
     lines.append(f"Tokenized user request: {' '.join(prompt_tokens)}")
     return "\n".join(lines)
 
@@ -158,37 +123,36 @@ def rank_schema_candidates(
     """Shortlist schemas using token boundaries before model scoring."""
     stopwords = {"a", "all", "and", "for", "in", "is", "of", "the", "to", "with"}
     prompt_tokens = {
-        token.lower()[:4]
-        for token in tokenize_unigram(prompt)
-        if token.isalpha() and token.lower() not in stopwords
+        token for token in word_tokens(prompt)
+        if token not in stopwords
     }
     prompt_words = {
-        token.lower()
-        for token in tokenize_unigram(prompt)
-        if token.isalpha() and token.lower() not in stopwords
+        token for token in word_tokens(prompt) if token not in stopwords
     }
     numeric_count = sum(
-        bool(re.fullmatch(r"-?\d+(?:\.\d+)?", token))
-        for token in tokenize_custom_hybrid(prompt)
+        1 for token in re.findall(r"-?\d+(?:\.\d+)?", prompt)
     )
     prompt_domain = detect_domain(prompt)
     prompt_domain_matches = domain_vocabulary_matches(prompt)
     scored: list[tuple[int, dict[str, Any]]] = []
     for schema in functions:
         description_tokens = {
-            token.lower()[:4]
-            for token in tokenize_unigram(schema["name"].replace("_", " "))
-            + tokenize_unigram(schema["description"])
-            if token.isalpha() and token.lower() not in stopwords
-        }
-        schema_words = {
-            token.lower()
-            for token in tokenize_unigram(
+            token
+            for token in word_tokens(
                 schema["name"].replace("_", " ")
                 + " "
                 + schema["description"]
             )
-            if token.isalpha() and token.lower() not in stopwords
+            if token not in stopwords
+        }
+        schema_words = {
+            token
+            for token in word_tokens(
+                schema["name"].replace("_", " ")
+                + " "
+                + schema["description"]
+            )
+            if token not in stopwords
         }
         score = (
             2 * len(prompt_words & schema_words)
@@ -218,26 +182,3 @@ def rank_schema_candidates(
         return [schema for _, schema in scored]
     return [schema for score, schema in scored if score == best_score]
 
-# =====================================================================
-# 4. EXECUTION FLOW
-# =====================================================================
-
-if __name__ == "__main__":
-    print("=" * 80)
-    print("PHASE 1: PROCESSING SCHEMAS AND FUNCTIONS")
-    print("=" * 80)
-    for schema in FUNCTION_SCHEMAS:
-        func_name = schema["name"]
-        algo, tokens = choose_and_run_tokenizer(func_name, is_schema=True)
-        print(f"Function : {func_name:<35} -> Algo Selected: {algo}")
-        print(f"Tokens   : {tokens}\n")
-
-    print("\n" + "=" * 80)
-    print("PHASE 2: RUNNING TEST PROMPTS")
-    print("=" * 80)
-    for idx, item in enumerate(TEST_PROMPTS, 1):
-        prompt_text = item["prompt"]
-        algo, tokens = choose_and_run_tokenizer(prompt_text, is_schema=False)
-        print(f"Test #{idx}: {prompt_text}")
-        print(f"Selected: {algo}")
-        print(f"Tokens  : {tokens}\n")
