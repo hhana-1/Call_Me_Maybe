@@ -1,0 +1,51 @@
+"""Look up token IDs in an exported vocabulary JSON file."""
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_VOCABULARY = "../data/output/vocabulary.json"
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse token IDs and vocabulary path."""
+    parser = argparse.ArgumentParser(description="Look up exported vocabulary tokens")
+    parser.add_argument("token_ids", nargs="+", type=int, help="Token IDs to look up")
+    parser.add_argument(
+        "--vocabulary",
+        default=DEFAULT_VOCABULARY,
+        help=f"Vocabulary JSON file (default: {DEFAULT_VOCABULARY})",
+    )
+    return parser.parse_args()
+
+
+def load_vocabulary(path: str) -> dict[int, str]:
+    """Load a token-to-ID JSON mapping and reverse it for lookup."""
+    with Path(path).open(encoding="utf-8") as handle:
+        raw: Any = json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError("Vocabulary must be a JSON object")
+    return {int(token_id): token for token, token_id in raw.items()}
+
+
+def main() -> int:
+    """Print the vocabulary value for each requested token ID."""
+    args = parse_args()
+    try:
+        vocabulary = load_vocabulary(args.vocabulary)
+        for token_id in args.token_ids:
+            token = vocabulary.get(token_id)
+            if token is None:
+                print(f"{token_id}: <not found>")
+            else:
+                print(f"{token_id}: {token!r}")
+        return 0
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        print(f"Error: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
