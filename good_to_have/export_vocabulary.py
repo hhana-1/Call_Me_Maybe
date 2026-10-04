@@ -8,6 +8,9 @@ from typing import Any
 from llm_sdk.llm_sdk import Small_LLM_Model
 
 
+DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "data/output/vocabulary.json"
+
+
 def parse_args() -> argparse.Namespace:
     """Parse model and output paths."""
     parser = argparse.ArgumentParser(description="Export the model vocabulary")
@@ -18,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="../data/output/vocabulary.json",
+        default=str(DEFAULT_OUTPUT),
         help="JSON file to create",
     )
     return parser.parse_args()

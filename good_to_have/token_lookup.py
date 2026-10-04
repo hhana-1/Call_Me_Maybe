@@ -1,22 +1,28 @@
-"""Look up token IDs in an exported vocabulary JSON file."""
+"""Look up token IDs in the model vocabulary."""
 
 import argparse
 import json
 from pathlib import Path
 from typing import Any
 
+from llm_sdk.llm_sdk import Small_LLM_Model
 
-DEFAULT_VOCABULARY = "../data/output/vocabulary.json"
+
+DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse token IDs and vocabulary path."""
-    parser = argparse.ArgumentParser(description="Look up exported vocabulary tokens")
+    """Parse token IDs and vocabulary source."""
+    parser = argparse.ArgumentParser(description="Look up model vocabulary tokens")
     parser.add_argument("token_ids", nargs="+", type=int, help="Token IDs to look up")
     parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Hugging Face model ID used by the SDK (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
         "--vocabulary",
-        default=DEFAULT_VOCABULARY,
-        help=f"Vocabulary JSON file (default: {DEFAULT_VOCABULARY})",
+        help="Optional vocabulary JSON file to use instead of the model vocabulary",
     )
     return parser.parse_args()
 
@@ -30,11 +36,21 @@ def load_vocabulary(path: str) -> dict[int, str]:
     return {int(token_id): token for token, token_id in raw.items()}
 
 
+def load_model_vocabulary(model_id: str) -> dict[int, str]:
+    """Load the token-to-ID mapping from the SDK model vocabulary file."""
+    model = Small_LLM_Model(model_id)
+    return load_vocabulary(model.get_path_to_vocab_file())
+
+
 def main() -> int:
     """Print the vocabulary value for each requested token ID."""
     args = parse_args()
     try:
-        vocabulary = load_vocabulary(args.vocabulary)
+        vocabulary = (
+            load_vocabulary(args.vocabulary)
+            if args.vocabulary
+            else load_model_vocabulary(args.model)
+        )
         for token_id in args.token_ids:
             token = vocabulary.get(token_id)
             if token is None:

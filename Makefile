@@ -5,7 +5,7 @@ run:
 	uv run python -m src
 
 export-vocabulary:
-	uv run python export_vocabulary.py
+	uv run python good_to_have/export_vocabulary.py
 
 debug:
 	uv run python -m pdb -m src
