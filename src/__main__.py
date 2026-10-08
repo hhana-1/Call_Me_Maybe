@@ -7,6 +7,8 @@ from pathlib import Path
 
 from client import TokenAwareConstrainedRouter, load_functions
 from llm_sdk.llm_sdk import Small_LLM_Model
+from src.models import DEFAULT_MODEL, MODEL_PRESETS, resolve_model
+from src.visualize import render_generation
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,6 +21,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", default="data/input/function_calling_tests.json")
     parser.add_argument(
         "--output", default="data/output/function_calling_results.json"
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=(
+            "Local HF model alias or repo id. Aliases: "
+            + ", ".join(sorted(MODEL_PRESETS)) + "."
+        ),
+    )
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Visualize each prompt's generation pipeline step by step.",
     )
     return parser.parse_args()
 
@@ -33,7 +48,10 @@ def main() -> int:
         if not isinstance(prompts, list):
             raise ValueError("Input prompts must be a JSON array")
 
-        router = TokenAwareConstrainedRouter(Small_LLM_Model())
+        model_name = resolve_model(args.model)
+        print(f"Using model: {model_name}", flush=True)
+        router = TokenAwareConstrainedRouter(Small_LLM_Model(model_name=model_name))
+        router.trace_enabled = args.trace
         results = []
         total_started = time.perf_counter()
         for item in prompts:
@@ -44,18 +62,24 @@ def main() -> int:
             response_finished = time.perf_counter()
             response_finish_time = time.strftime("%H:%M:%S")
             response_elapsed_minutes = (response_finished - response_started)/60
-            print(
-                json.dumps(
-                    {
-                        "response": result,
-                        "started_at": response_start_time,
-                        "finished_at": response_finish_time,
-                        "time passed": round(response_elapsed_minutes, 3),
-                    },
-                    indent=2,
-                ),
-                flush=True,
-            )
+            if args.trace and router.last_trace is not None:
+                print(
+                    render_generation(router.last_trace, result["parameters"]),
+                    flush=True,
+                )
+            else:
+                print(
+                    json.dumps(
+                        {
+                            "response": result,
+                            "started_at": response_start_time,
+                            "finished_at": response_finish_time,
+                            "time passed": round(response_elapsed_minutes, 3),
+                        },
+                        indent=2,
+                    ),
+                    flush=True,
+                )
             results.append(result)
 
         output_path = Path(args.output)

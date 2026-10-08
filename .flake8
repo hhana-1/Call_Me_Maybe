@@ -1,0 +1,3 @@
+[flake8]
+# Skip the virtualenv and the external, unmodified SDK (mirrors tool.mypy.exclude).
+extend-exclude = .venv, llm_sdk

@@ -8,7 +8,9 @@ from typing import Any
 from llm_sdk.llm_sdk import Small_LLM_Model
 
 
-DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "data/output/vocabulary.json"
+DEFAULT_OUTPUT = (
+    Path(__file__).resolve().parents[1] / "data/output/vocabulary.json"
+)
 
 
 def parse_args() -> argparse.Namespace:

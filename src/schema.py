@@ -10,6 +10,7 @@ class FunctionSchema(BaseModel):
     parameters: dict[str, dict[str, Any]]
     returns: dict[str, str]
 
+
 class FunctionCall(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

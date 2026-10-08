@@ -5,8 +5,10 @@ _This project has been created as part of the 42 curriculum by hhulic._
 ## Description
 
 This project converts natural-language requests into structured function calls.
-It uses the provided `llm_sdk` package and the `Qwen/Qwen3-0.6B` model to select
-one function from a JSON definition file and extract its arguments.
+It uses the provided `llm_sdk` package to select one function from a JSON
+definition file and extract its arguments. The model defaults to
+`Qwen/Qwen3-0.6B` but can be swapped for any of several free local models (see
+[Model options](#model-options)).
 
 The generated output contains exactly these fields:
 
@@ -64,6 +66,33 @@ Inspect the result with:
 python3 -m json.tool data/output/function_calling_results.json
 ```
 
+## Model options
+
+The backend model is selected with `--model`, which accepts either a built-in
+alias or any ungated Hugging Face causal-LM repo id (downloaded on first use):
+
+```sh
+uv run python -m src --model smollm2-360m
+# or via make:
+make run-model MODEL=smollm2-360m
+```
+
+Built-in aliases:
+
+| Alias            | Hugging Face repo                         |
+| ---------------- | ----------------------------------------- |
+| `qwen3-0.6b`     | `Qwen/Qwen3-0.6B` (default)               |
+| `qwen2.5-0.5b`   | `Qwen/Qwen2.5-0.5B-Instruct`              |
+| `smollm2-360m`   | `HuggingFaceTB/SmolLM2-360M-Instruct`     |
+| `smollm2-135m`   | `HuggingFaceTB/SmolLM2-135M-Instruct`     |
+| `tinyllama-1.1b` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0`      |
+
+All aliases are ungated, so no Hugging Face login or token is required. A full
+repo id such as `--model org/model` is also accepted, which lets you use gated
+models whose license you have already accepted. Every model runs through the
+same logit-routing path, so results stay directly comparable; the smallest
+models (135M/360M) are fastest on CPU but may route less accurately.
+
 ## Algorithm
 
 `choose_tokenizer.py` loads the live JSON definitions and test prompts. It
@@ -79,6 +108,30 @@ with Pydantic before writing JSON.
 The provided `llm_sdk` directory is treated as an external project component and
 is not modified by this project.
 
+## Generation Visualization
+
+Pass `--trace` (or run `make trace`) to visualize the generation process for
+every prompt step by step instead of printing the timing JSON:
+
+```sh
+uv run python -m src --trace
+```
+
+For each prompt the trace shows:
+
+1. **Tokenization** — the prompt split into model tokens.
+2. **Candidate functions** — the schemas kept after shortlisting.
+3. **Model routing** — the restricted next-token logits for each candidate's
+   description token, the softmax probabilities derived from them, and a bar
+   chart, with the selected function marked.
+4. **Selected function** — the winning function name.
+5. **Extracted arguments** — the final arguments and their Python types.
+
+This makes the constrained routing decision (logits → probabilities →
+selection) directly observable. The rendering lives in `src/visualize.py`; the
+router records the per-step trace in `TokenAwareConstrainedRouter.last_trace`
+only when `trace_enabled` is set, so normal runs pay no overhead.
+
 ## Project Structure
 
 ```text
@@ -86,6 +139,7 @@ client.py                         Routing and argument validation
 choose_tokenizer.py               JSON loading and tokenizer-based shortlisting
 src/__main__.py                   Command-line entry point
 src/schema.py                     Pydantic models
+src/visualize.py                  Generation-process trace rendering (--trace)
 llm_sdk/                          Provided Qwen SDK
 data/input/                       Function definitions and test prompts
 data/output/                      Generated results, not submitted

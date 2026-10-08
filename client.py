@@ -5,7 +5,11 @@ import math
 import re
 from typing import Any, Protocol, Sequence
 
-from choose_tokenizer import build_routing_context, rank_schema_candidates
+from choose_tokenizer import (
+    build_routing_context,
+    rank_schema_candidates,
+    tokenize_with_model,
+)
 from src.schema import FunctionCall, FunctionSchema
 
 
@@ -44,6 +48,8 @@ class TokenAwareConstrainedRouter:
     def __init__(self, model_wrapper: ModelWrapper) -> None:
         self.llm = model_wrapper
         self.function_cache: dict[str, tuple[str, int]] = {}
+        self.trace_enabled = False
+        self.last_trace: dict[str, Any] | None = None
 
     def _encode(self, text: str) -> list[int]:
         """Encode text with the model SDK's real tokenizer."""
@@ -114,10 +120,41 @@ class TokenAwareConstrainedRouter:
             name: logits[token_id] for name, token_id in candidates.items()
         }
         probabilities = _softmax(candidate_logits)
-        best_name = max(probabilities, key=probabilities.get)
+        best_name = max(probabilities, key=lambda name: probabilities[name])
+        if self.trace_enabled:
+            self._record_trace(prompt, candidates, candidate_logits,
+                               probabilities, best_name)
         return next(
             function for function in candidate_functions if function.name == best_name
         )
+
+    def _record_trace(
+        self,
+        prompt: str,
+        candidates: dict[str, int],
+        candidate_logits: dict[str, float],
+        probabilities: dict[str, float],
+        best_name: str,
+    ) -> None:
+        """Store a step-by-step record of the routing decision."""
+        _, prompt_tokens = tokenize_with_model(self.llm, prompt)
+        ordered = sorted(
+            candidates, key=lambda name: probabilities[name], reverse=True
+        )
+        self.last_trace = {
+            "prompt": prompt,
+            "prompt_tokens": prompt_tokens,
+            "candidates": [
+                {
+                    "name": name,
+                    "token_id": candidates[name],
+                    "logit": candidate_logits[name],
+                    "probability": probabilities[name],
+                }
+                for name in ordered
+            ],
+            "selected": best_name,
+        }
 
     def extract_arguments(
         self, prompt: str, function: FunctionSchema
@@ -212,7 +249,7 @@ class TokenAwareConstrainedRouter:
             if match:
                 return match.group(2)
         if name == "path":
-            path_candidates = [
+            path_candidates: list[str] = [
                 token.strip(" '\"")
                 for token in re.findall(r"[^\s,;]+", prompt)
                 if TokenAwareConstrainedRouter._looks_like_path(token)
@@ -230,7 +267,7 @@ class TokenAwareConstrainedRouter:
                 return (match.group(1) or match.group(2)).lower()
         if index < len(quoted):
             return quoted[index]
-        words = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", prompt)
+        words: list[str] = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", prompt)
         if not words:
             raise ValueError(f"Missing string argument: {name}")
         return words[-1]
@@ -264,19 +301,19 @@ class TokenAwareConstrainedRouter:
         if not hasattr(backend, "generate_call"):
             selected = self.select_function(prompt, functions)
             return self.make_call(prompt, selected)
-        raw = backend.generate_call(prompt, functions)  # type: ignore[attr-defined]
+        raw = backend.generate_call(prompt, functions)
         name = raw.get("name")
         parameters = raw.get("parameters")
-        selected = next((item for item in functions if item.name == name), None)
-        if selected is None:
+        matched = next((item for item in functions if item.name == name), None)
+        if matched is None:
             raise ValueError(f"Model selected unknown function: {name}")
         if not isinstance(parameters, dict):
             raise ValueError("Model parameters must be a JSON object")
         # Require exactly the declared parameter set; neither omissions nor extras are valid.
-        expected = set(selected.parameters)
+        expected = set(matched.parameters)
         if set(parameters) != expected:
             raise ValueError("Model parameters do not match the function schema")
-        for parameter_name, specification in selected.parameters.items():
+        for parameter_name, specification in matched.parameters.items():
             value = parameters[parameter_name]
             parameter_type = specification.get("type")
             valid = (

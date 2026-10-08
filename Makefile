@@ -4,6 +4,12 @@ install:
 run:
 	uv run python -m src
 
+run-model:
+	uv run python -m src --model $(MODEL)
+
+trace:
+	uv run python -m src --trace
+
 export-vocabulary:
 	uv run python good_to_have/export_vocabulary.py
 

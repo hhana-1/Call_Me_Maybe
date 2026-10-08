@@ -13,16 +13,26 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 
 def parse_args() -> argparse.Namespace:
     """Parse token IDs and vocabulary source."""
-    parser = argparse.ArgumentParser(description="Look up model vocabulary tokens")
-    parser.add_argument("token_ids", nargs="+", type=int, help="Token IDs to look up")
+    parser = argparse.ArgumentParser(
+        description="Look up model vocabulary tokens"
+    )
+    parser.add_argument(
+        "token_ids", nargs="+", type=int, help="Token IDs to look up"
+    )
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        help=f"Hugging Face model ID used by the SDK (default: {DEFAULT_MODEL})",
+        help=(
+            "Hugging Face model ID used by the SDK "
+            f"(default: {DEFAULT_MODEL})"
+        ),
     )
     parser.add_argument(
         "--vocabulary",
-        help="Optional vocabulary JSON file to use instead of the model vocabulary",
+        help=(
+            "Optional vocabulary JSON file to use instead of the "
+            "model vocabulary"
+        ),
     )
     return parser.parse_args()
 
