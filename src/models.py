@@ -5,7 +5,6 @@ MODEL_PRESETS: dict[str, str] = {
     "qwen2.5-0.5b": "Qwen/Qwen2.5-0.5B-Instruct",
     "smollm2-360m": "HuggingFaceTB/SmolLM2-360M-Instruct",
     "smollm2-135m": "HuggingFaceTB/SmolLM2-135M-Instruct",
-    "tinyllama-1.1b": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
 }
 
 DEFAULT_MODEL = "qwen3-0.6b"

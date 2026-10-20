@@ -10,14 +10,14 @@ from pydantic import BaseModel, RootModel
 DEFAULT_INPUT = "../data/input/function_calling_tests.json"
 
 
-# Define the schema for a single prompt object
 class PromptItem(BaseModel):
+    """One entry of the prompt file: ``{"prompt": "..."}``."""
+
     prompt: str
 
 
-# Define the schema for the entire JSON file array
 class PromptList(RootModel[List[PromptItem]]):
-    pass
+    """The whole prompt file: a JSON array of prompt entries."""
 
 
 def parse_args() -> argparse.Namespace:
