@@ -224,10 +224,6 @@ class BPETokenizer(BaseModel):
         ids.extend(self._encode_text(text[start:]))
         return ids
 
-    def special_id(self, token: str) -> int | None:
-        """Return the id of a special token, or None if the model lacks it."""
-        return self.special_tokens.get(token)
-
     def decode(self, ids: list[int]) -> str:
         """Convert token ids back to text.
 

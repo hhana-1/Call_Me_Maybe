@@ -2,27 +2,21 @@
 
 The model writes each call as JSON::
 
-    {"name": "<function>", "parameters": {"<key>": <value>, ...}}
+    {"name": "fn_add_numbers", "arguments": {"a": 2, "b": 3}}
 
-At every step the decoder lists the tokens that keep this text valid and
-faithful to the function schema, sets every other logit to minus infinity
-and takes the best remaining token. When only one token is allowed it is
-appended without calling the model at all.
+At every step only the tokens that keep this text valid, and true to the
+function's schema, are allowed: every other logit is set to minus infinity.
+When just one token is allowed it is added without calling the model.
 
-Generation runs in two stages to keep each model call short:
+Two prompts keep each model call short:
 
-1. **Function name**: the prompt lists every function, and the name is
-   decoded through a trie of the names' token sequences.
-2. **Arguments**: a shorter prompt shows only the chosen function, and each
-   value is decoded under the grammar of its type (number, integer,
-   boolean or string).
-
-Prompts use the model's own chat format (``<|im_start|>`` turns and an
-empty ``<think>`` block for Qwen3) when its tokenizer has those special
-tokens, and plain text otherwise.
+1. **Name**: the prompt lists every function; the model writes one name.
+2. **Arguments**: the prompt shows only the chosen function; each value is
+   written under the rules of its type (number, integer, boolean, string).
 """
 
 import json
+import re
 from typing import Any, Sequence
 
 import numpy as np
@@ -32,97 +26,79 @@ from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
 from src.schema import FunctionCall, FunctionSchema
 from src.tokenizer import BPETokenizer
 
-_DIGITS = "0123456789"
-_JSON_ESCAPES = '"\\/bfnrt'
-_NO_INDEX = -1
+MAX_STRING_TOKENS = 48
+MAX_NUMBER_CHARS = 40
+JSON_ESCAPES = '"\\/bfnrt'
 
-TokenIds = npt.NDArray[np.int64]
+# A number written so far ("", "-", "12", "12.", "12.5") and a finished one.
+NUMBER_PREFIX = re.compile(r"-?((0|[1-9][0-9]*)(\.[0-9]*)?)?")
+NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
+INTEGER_PREFIX = re.compile(r"-?(0|[1-9][0-9]*)?")
+INTEGER = re.compile(r"-?(0|[1-9][0-9]*)")
+
+PICK_FUNCTION = (
+    "You call functions. Pick the one function whose description matches "
+    "what the user asks for, and reply with the call as JSON.\n\nFunctions:\n"
+)
+FILL_ARGUMENTS = (
+    "You call functions. Fill in the arguments of this function with the "
+    "values the user asks for, and reply with the call as JSON.\n\n"
+    "Function:\n"
+)
 
 
-def _signature(function: FunctionSchema) -> str:
-    """Render a function as ``name(a: number, b: string): description``."""
+def describe(function: FunctionSchema) -> str:
+    """Render a function as ``- name(a: number, b: string): description``."""
     parameters = ", ".join(
         f"{key}: {spec.get('type', 'unknown')}"
         for key, spec in function.parameters.items()
     )
-    return f"{function.name}({parameters}): {function.description}"
+    return f"- {function.name}({parameters}): {function.description}"
 
 
-def _selection_instructions(functions: Sequence[FunctionSchema]) -> str:
-    """System text for stage 1: every function the model may call."""
-    listing = "\n".join(f"- {_signature(function)}" for function in functions)
-    return (
-        "You call functions. Pick the one function whose description matches "
-        "what the user asks for, and reply with the call as JSON.\n\n"
-        f"Functions:\n{listing}"
-    )
+def chat(tokenizer: BPETokenizer, system: str, user: str, answer: str
+         ) -> list[int]:
+    """Encode a prompt in Qwen's chat format, ending inside the answer.
 
-
-def _argument_instructions(function: FunctionSchema) -> str:
-    """System text for stage 2: only the function that was chosen."""
-    return (
-        "You call functions. Fill in the arguments of this function with the "
-        "values the user asks for, and reply with the call as JSON.\n\n"
-        f"Function:\n- {_signature(function)}"
-    )
-
-
-def _argument_answer(function: FunctionSchema) -> str:
-    """Start of the stage-2 answer; it ends where the first value begins."""
-    keys = list(function.parameters)
-    opening = f"{json.dumps(keys[0])}:" if keys else "}}"
-    return (
-        f'{{"name": {json.dumps(function.name)}, "arguments": {{{opening}'
-    )
-
-
-def _number_options(text: str, integer: bool, limit: int) -> tuple[str, bool]:
-    """Return the characters that may follow ``text`` in a JSON number.
-
-    Args:
-        text: The number written so far (without the leading space).
-        integer: Whether ``.`` is forbidden.
-        limit: Maximum number of characters before the number must end.
-
-    Returns:
-        The allowed next characters, and whether ``text`` is already a
-        complete number (so the value may end here).
+    The markers are written as text; the tokenizer turns each one into its
+    single special-token id. Qwen3 also gets an empty ``<think>`` block (no
+    thinking) and its ``<tool_call>`` marker when the model has them.
     """
-    body = text[1:] if text.startswith("-") else text
-    if not body:
-        return (_DIGITS + "-" if not text else _DIGITS), False
-    if len(text) >= limit:
-        return ("", True) if body[-1] != "." else (_DIGITS, False)
-    if "." in body:
-        fraction = body.split(".", 1)[1]
-        return _DIGITS, bool(fraction)
-    allowed = "" if body == "0" else _DIGITS  # JSON forbids leading zeros
-    return allowed + ("" if integer else "."), True
+    text = (
+        f"<|im_start|>system\n{system}<|im_end|>\n"
+        f"<|im_start|>user\n{user}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    if "<think>" in tokenizer.special_tokens:
+        text += "<think>\n\n</think>\n\n"
+    if "<tool_call>" in tokenizer.special_tokens:
+        text += "<tool_call>\n"
+    return tokenizer.encode(text + answer)
 
 
-def _scan_string_token(text: str, escaped: bool) -> tuple[bool, bool, int]:
-    """Check one token inside a JSON string.
+def scan_string(text: str, escaped: bool) -> tuple[bool, bool, str | None]:
+    """Check a token's text written inside a JSON string.
 
     Args:
         text: The token's text.
-        escaped: Whether the previous character was an unfinished ``\\``.
+        escaped: Whether the string so far ends with an unfinished ``\\``.
 
     Returns:
-        ``(valid, escaped_after, close_index)``, where ``close_index`` is the
-        position of the closing quote in ``text`` or ``-1`` if it has none.
+        ``(valid, escaped, rest)``: ``rest`` is the text after the closing
+        quote, or None if the string is still open.
     """
     for index, char in enumerate(text):
         if escaped:
-            if char not in _JSON_ESCAPES:
-                return False, False, _NO_INDEX
+            if char not in JSON_ESCAPES:
+                return False, False, None
             escaped = False
         elif char == "\\":
             escaped = True
         elif char == '"':
-            return True, False, index
+            return True, False, text[index + 1:]
         elif ord(char) < 0x20:
-            return False, False, _NO_INDEX
-    return True, escaped, _NO_INDEX
+            return False, False, None
+    return True, escaped, None
 
 
 class TokenAwareConstrainedRouter(BaseModel):
@@ -131,10 +107,8 @@ class TokenAwareConstrainedRouter(BaseModel):
     Attributes:
         llm: The SDK model; only ``get_logits_from_input_ids`` is used.
         tokenizer: The project's BPE tokenizer for the same model.
-        trace_enabled: Record each decoding step in ``last_trace``.
-        last_trace: Steps of the most recent call when tracing is enabled.
-        max_string_tokens: Longest string value before it is closed.
-        max_number_chars: Longest number value before it is ended.
+        trace_enabled: Record every decoding step in ``last_trace``.
+        last_trace: Steps of the latest call, when tracing is enabled.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -143,18 +117,18 @@ class TokenAwareConstrainedRouter(BaseModel):
     tokenizer: BPETokenizer
     trace_enabled: bool = False
     last_trace: dict[str, Any] | None = None
-    max_string_tokens: int = 48
-    max_number_chars: int = 40
 
     _texts: list[str] = PrivateAttr(default_factory=list)
-    _plain_string_ids: TokenIds = PrivateAttr(
+    _plain_ids: npt.NDArray[np.int64] = PrivateAttr(
         default_factory=lambda: np.zeros(0, dtype=np.int64)
     )
-    _special_string_ids: list[int] = PrivateAttr(default_factory=list)
+    _quote_ids: list[int] = PrivateAttr(default_factory=list)
     _opening_ids: list[int] = PrivateAttr(default_factory=list)
-    _char_ids: dict[str, int] = PrivateAttr(default_factory=dict)
+    _char_ids: dict[int, str] = PrivateAttr(default_factory=dict)
+    _sign_ids: dict[int, str] = PrivateAttr(default_factory=dict)
     _endings: dict[str, list[int]] = PrivateAttr(default_factory=dict)
     _steps: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+    _field: str = PrivateAttr(default="name")
     _calls: int = PrivateAttr(default=0)
 
     @field_validator("llm")
@@ -166,29 +140,24 @@ class TokenAwareConstrainedRouter(BaseModel):
         return value
 
     def model_post_init(self, __context: Any) -> None:
-        """Decode every token once and sort tokens into the masks we need."""
+        """Decode every token once and sort the tokens into masks."""
         size = max(self.tokenizer.vocab.values()) + 1
-        self._texts = [
-            self.tokenizer.token_text(index) for index in range(size)
-        ]
-        plain: list[int] = []
+        self._texts = [self.tokenizer.token_text(i) for i in range(size)]
+        plain = []
         for index, text in enumerate(self._texts):
-            if not text or "�" in text or any(ord(c) < 0x20 for c in text):
-                continue
+            if not text or "�" in text or min(map(ord, text)) < 0x20:
+                continue  # empty, half a character, or a control character
             if '"' in text or "\\" in text:
-                self._special_string_ids.append(index)
+                self._quote_ids.append(index)
             else:
                 plain.append(index)
-        self._plain_string_ids = np.array(plain, dtype=np.int64)
+        self._plain_ids = np.array(plain, dtype=np.int64)
         self._opening_ids = [
-            index for index in self._special_string_ids
+            index for index in self._quote_ids
             if self._texts[index].startswith(' "')
         ]
-        for char in _DIGITS + ".-":
-            ids = self.tokenizer.encode(char)
-            if len(ids) != 1:
-                raise ValueError(f"Tokenizer has no single token for {char!r}")
-            self._char_ids[char] = ids[0]
+        self._char_ids = {self._single_id(c): c for c in "0123456789."}
+        self._sign_ids = {self._single_id(" "): "", self._single_id(" -"): "-"}
 
     def generate_call(
         self, prompt: str, functions: Sequence[FunctionSchema]
@@ -201,303 +170,230 @@ class TokenAwareConstrainedRouter(BaseModel):
         """
         if not functions:
             raise ValueError("No function definitions were provided")
-        self._steps, self._calls = [], 0
-        function, name_steps = self._choose_function(prompt, functions)
-        parameters = self._fill_arguments(prompt, function)
+        self._steps, self._calls, self._field = [], 0, "name"
+
+        # Stage 1: the name. The closing quote makes every choice end
+        # differently, even when one name starts another (fn_read, fn_read_x).
+        context = chat(
+            self.tokenizer,
+            PICK_FUNCTION + "\n".join(map(describe, functions)),
+            prompt,
+            '{"name": "',
+        )
+        name = self._choose_text(context, [f'{f.name}"' for f in functions])
+        function = next(f for f in functions if f'{f.name}"' == name)
+
+        # Stage 2: the arguments, in the order the schema lists them.
+        parameters: dict[str, Any] = {}
+        keys = list(function.parameters)
+        if keys:
+            context = chat(
+                self.tokenizer,
+                FILL_ARGUMENTS + describe(function),
+                prompt,
+                f'{{"name": {json.dumps(function.name)}, "arguments": '
+                f"{{{json.dumps(keys[0])}:",
+            )
+        for position, key in enumerate(keys):
+            self._field = key
+            last = position + 1 == len(keys)
+            ending = "}}" if last else f", {json.dumps(keys[position + 1])}:"
+            parameters[key] = self._value(
+                context, function.parameters[key].get("type"), ending
+            )
+
         if self.trace_enabled:
             self.last_trace = {
                 "prompt": prompt,
                 "prompt_tokens": [
-                    self.tokenizer.token_text(index)
-                    for index in self.tokenizer.encode(prompt)
+                    self.tokenizer.token_text(i)
+                    for i in self.tokenizer.encode(prompt)
                 ],
                 "function_count": len(functions),
-                "name_steps": name_steps,
                 "selected": function.name,
-                "argument_steps": self._steps,
+                "steps": self._steps,
                 "model_calls": self._calls,
             }
         return FunctionCall(
             prompt=prompt, name=function.name, parameters=parameters
         )
 
-    # ----- stage 1: function name -----------------------------------------
-
-    def _choose_function(
-        self, prompt: str, functions: Sequence[FunctionSchema]
-    ) -> tuple[FunctionSchema, list[dict[str, Any]]]:
-        """Decode the function name, allowing only real names (a trie)."""
-        context = self._conversation(
-            _selection_instructions(functions), prompt, '{"name": "'
+    def _value(self, context: list[int], kind: Any, ending: str) -> Any:
+        """Decode one argument value, then add the JSON that follows it."""
+        if kind in ("number", "integer"):
+            return self._number(context, kind == "integer", ending)
+        if kind == "string":
+            return self._string(context, ending)
+        if kind == "boolean":
+            word = self._choose_text(context, [" true", " false"])
+            self._force(context, ending)
+            return word == " true"
+        raise ValueError(
+            f"Unsupported parameter type {kind!r} for {self._field!r}"
         )
-        names = [
-            (item, self.tokenizer.encode(item.name)) for item in functions
-        ]
-        close_quote = self.tokenizer.encode('"')[0]
-        steps: list[dict[str, Any]] = []
-        while True:
-            position = len(steps)
-            finished = [item for item, ids in names if len(ids) == position]
-            longer = [pair for pair in names if len(pair[1]) > position]
-            if finished and not longer:
-                return finished[0], steps
-            branches: dict[int, list[str]] = {}
-            for item, ids in longer:
-                branches.setdefault(ids[position], []).append(item.name)
-            if finished:  # a name that is a prefix of another may end here
-                branches[close_quote] = [finished[0].name]
-            token, step = self._pick(context, list(branches), options=True)
-            step["functions"] = branches[token]
-            for option in step.get("options", []):
-                option["functions"] = branches[option["id"]]
-            steps.append(step)
-            if token == close_quote and finished:
-                return finished[0], steps
-            context.append(token)
-            names = [pair for pair in longer if pair[1][position] == token]
 
-    # ----- stage 2: arguments ---------------------------------------------
+    def _choose_text(self, context: list[int], choices: list[str]) -> str:
+        """Let the model write exactly one of ``choices``.
 
-    def _fill_arguments(
-        self, prompt: str, function: FunctionSchema
-    ) -> dict[str, Any]:
-        """Decode every argument value under the grammar of its type."""
-        context = self._conversation(
-            _argument_instructions(function),
-            prompt,
-            _argument_answer(function),
-        )
-        keys = list(function.parameters)
-        values: dict[str, Any] = {}
-        for position, key in enumerate(keys):
-            ending = (
-                f", {json.dumps(keys[position + 1])}:"
-                if position + 1 < len(keys)
-                else "}}"
-            )
-            kind = function.parameters[key].get("type")
-            if kind in ("number", "integer"):
-                values[key] = self._number(context, key, ending, kind)
-            elif kind == "boolean":
-                values[key] = self._boolean(context, key, ending)
-            elif kind == "string":
-                values[key] = self._string(context, key, ending)
-            else:
-                raise ValueError(
-                    f"Unsupported parameter type {kind!r} for {key!r} "
-                    f"in {function.name}"
-                )
-        return values
-
-    def _number(
-        self, context: list[int], key: str, ending: str, kind: str
-    ) -> int | float:
-        """Decode a JSON number: digits, an optional sign and decimal point.
-
-        Qwen writes `` -`` (space + minus) as one token, so the value starts
-        with a choice between `` `` and `` -`` instead of a forced space.
+        The choices' token sequences form a trie: at each step only the next
+        tokens of the choices that still match are allowed.
         """
-        space, signed = self.tokenizer.encode(" "), self.tokenizer.encode(" -")
-        text = ""
-        if len(space) == 1 and len(signed) == 1:
-            token, step = self._pick(context, [space[0], signed[0]])
-            self._record(step, key)
-            context.append(token)
-            text = "-" if token == signed[0] else ""
-            sign_done = True
-        else:
-            self._force(context, " ", key)
-            sign_done = False
-        while True:
-            chars, complete = _number_options(
-                text, kind == "integer", self.max_number_chars
-            )
-            if sign_done:
-                chars = chars.replace("-", "")
-            by_token = {self._char_ids[char]: char for char in chars}
-            allowed = list(by_token)
-            if complete:
-                allowed += self._ending_ids(ending)
-            token, step = self._pick(context, allowed)
-            self._record(step, key)
-            context.append(token)
-            if token in by_token:
-                text += by_token[token]
-                continue
-            self._force(context, ending[len(self._texts[token]):], key)
-            value = json.loads(text)
-            return int(value) if kind == "integer" else float(value)
-
-    def _boolean(self, context: list[int], key: str, ending: str) -> bool:
-        """Decode ``true`` or ``false``."""
-        words = {
-            word: self.tokenizer.encode(" " + word)
-            for word in ("true", "false")
-        }
+        sequences = {text: self.tokenizer.encode(text) for text in choices}
         written: list[int] = []
         while True:
-            matching = {
-                word: ids for word, ids in words.items()
-                if ids[:len(written)] == written
-            }
-            done = [word for word, ids in matching.items() if ids == written]
-            if done:
-                self._force(context, ending, key)
-                return done[0] == "true"
-            allowed = sorted({ids[len(written)] for ids in matching.values()})
-            token, step = self._pick(context, allowed)
-            self._record(step, key)
-            context.append(token)
-            written.append(token)
-
-    def _string(self, context: list[int], key: str, ending: str) -> str:
-        """Decode a JSON string; escapes are checked as they are written.
-
-        The first token must start with `` "``. Qwen merges the quote with
-        what follows (`` "/``, `` "[``), so forcing a lone quote would stop
-        the model from writing ``/home`` or ``[aeiou]``.
-        """
-        content, escaped, count = "", False, 0
-        while True:
-            opening = count == 0
-            closing_only = count >= self.max_string_tokens and not escaped
-            allowed: list[int] = []
-            candidates = (
-                self._opening_ids if opening else self._special_string_ids
-            )
-            for index in candidates:
-                text = self._texts[index][2 if opening else 0:]
-                valid, _, close = _scan_string_token(text, escaped)
-                if not valid or (closing_only and close == _NO_INDEX):
+            branches: dict[int, list[str]] = {}
+            for text, ids in sequences.items():
+                if ids[:len(written)] != written:
                     continue
-                if close == _NO_INDEX or ending.startswith(text[close + 1:]):
-                    allowed.append(index)
-            plain = (
-                self._plain_string_ids
-                if not (escaped or closing_only or opening)
-                else np.zeros(0, dtype=np.int64)
-            )
-            token, step = self._pick(context, allowed, plain)
-            self._record(step, key)
-            context.append(token)
-            count += 1
-            piece = self._texts[token][2 if opening else 0:]
-            _, escaped, close = _scan_string_token(piece, escaped)
-            if close == _NO_INDEX:
-                content += piece
-                continue
-            content += piece[:close]
-            self._force(context, ending[len(piece) - close - 1:], key)
-            value: str = json.loads(f'"{content}"')
-            return value
+                if len(ids) == len(written):
+                    return text
+                branches.setdefault(ids[len(written)], []).append(text)
+            labels = {
+                token: ", ".join(text.strip(' "') for text in texts)
+                for token, texts in branches.items()
+            }
+            written.append(self._pick(context, list(branches), labels=labels))
 
-    # ----- shared helpers ---------------------------------------------------
+    def _number(self, context: list[int], integer: bool, ending: str
+                ) -> int | float:
+        """Decode a JSON number: a sign, digits and, unless integer, one dot.
 
-    def _conversation(self, system: str, user: str, answer: str) -> list[int]:
-        """Encode a chat prompt that ends inside the assistant's answer.
-
-        Special tokens are inserted by id, so a model without them (or with
-        only some of them) still gets a sensible prompt.
+        It starts with `` `` or `` -``: Qwen writes space + minus as one
+        token, so a forced space would make negative numbers unlikely.
         """
-        tokenizer = self.tokenizer
-        start = tokenizer.special_id("<|im_start|>")
-        end = tokenizer.special_id("<|im_end|>")
-        if start is None or end is None:
-            return tokenizer.encode(
-                f"{system}\n\nRequest: {user}\nCall: {answer}"
-            )
-        ids = [start, *tokenizer.encode(f"system\n{system}"), end]
-        ids += [*tokenizer.encode("\n"), start]
-        ids += [*tokenizer.encode(f"user\n{user}"), end]
-        ids += [*tokenizer.encode("\n"), start]
-        ids += tokenizer.encode("assistant\n")
-        think = tokenizer.special_id("<think>")
-        think_end = tokenizer.special_id("</think>")
-        if think is not None and think_end is not None:  # Qwen3: no thinking
-            ids += [think, *tokenizer.encode("\n\n"), think_end]
-            ids += tokenizer.encode("\n\n")
-        tool_call = tokenizer.special_id("<tool_call>")
-        if tool_call is not None:
-            return ids + [tool_call, *tokenizer.encode("\n" + answer)]
-        return ids + tokenizer.encode(answer)
+        prefix, finished = (
+            (INTEGER_PREFIX, INTEGER) if integer else (NUMBER_PREFIX, NUMBER)
+        )
+        text = self._sign_ids[self._pick(context, list(self._sign_ids))]
+        while True:
+            complete = finished.fullmatch(text) is not None
+            room = len(text) < MAX_NUMBER_CHARS or not complete
+            chars = {
+                token: char for token, char in self._char_ids.items()
+                if room and prefix.fullmatch(text + char)
+            }
+            allowed = list(chars) + (self._ending_ids(ending) if complete
+                                     else [])
+            token = self._pick(context, allowed)
+            if token not in chars:  # the value ended with the next JSON
+                self._force(context, ending[len(self._texts[token]):])
+                return int(text) if integer else float(text)
+            text += chars[token]
+
+    def _string(self, context: list[int], ending: str) -> str:
+        """Decode a JSON string, checking escapes as they are written.
+
+        The first token must start with `` "``: Qwen merges the quote with
+        what follows (`` "/``, `` "[``), so a forced lone quote would keep
+        the model from writing ``/home`` or ``[aeiou]``. After
+        ``MAX_STRING_TOKENS`` tokens only a closing quote is allowed.
+        """
+        written, escaped = "", False
+        for count in range(MAX_STRING_TOKENS + 1):
+            skip = 2 if count == 0 else 0  # leave out the opening ' "'
+            must_close = count == MAX_STRING_TOKENS
+            allowed = []
+            for token in self._opening_ids if count == 0 else self._quote_ids:
+                text = self._texts[token][skip:]
+                valid, _, rest = scan_string(text, escaped)
+                if valid and (
+                    ending.startswith(rest) if rest is not None
+                    else not must_close
+                ):
+                    allowed.append(token)
+            plain = None if skip or escaped or must_close else self._plain_ids
+            token = self._pick(context, allowed, plain)
+            piece = self._texts[token][skip:]
+            _, escaped, rest = scan_string(piece, escaped)
+            if rest is None:
+                written += piece
+                continue
+            written += piece[:len(piece) - len(rest) - 1]
+            self._force(context, ending[len(rest):])
+            value: str = json.loads(f'"{written}"')
+            return value
+        raise ValueError("The string value did not end")
 
     def _ending_ids(self, ending: str) -> list[int]:
-        """Tokens whose text starts the structure that follows a value."""
+        """Tokens whose text starts the JSON that follows a value."""
         if ending not in self._endings:
             self._endings[ending] = [
-                index for index, text in enumerate(self._texts)
+                token for token, text in enumerate(self._texts)
                 if text and ending.startswith(text)
             ]
         return self._endings[ending]
 
-    def _force(self, context: list[int], text: str, key: str) -> None:
-        """Append fixed JSON structure without calling the model."""
+    def _single_id(self, text: str) -> int:
+        """The id of ``text``, which must be exactly one token."""
+        ids = self.tokenizer.encode(text)
+        if len(ids) != 1:
+            raise ValueError(f"Tokenizer has no single token for {text!r}")
+        return ids[0]
+
+    def _force(self, context: list[int], text: str) -> None:
+        """Add fixed JSON structure without calling the model."""
         for token in self.tokenizer.encode(text):
             context.append(token)
-            self._record(
-                {"id": token, "text": self._texts[token], "forced": True}, key
-            )
+            self._record({"text": self._texts[token], "forced": True})
 
-    def _record(self, step: dict[str, Any], key: str) -> None:
-        """Remember an argument step for the trace."""
+    def _record(self, step: dict[str, Any]) -> None:
+        """Remember a step for the trace."""
         if self.trace_enabled:
-            self._steps.append({**step, "field": key})
+            self._steps.append({"field": self._field, **step})
 
     def _pick(
         self,
         context: list[int],
         allowed: list[int],
-        extra: TokenIds | None = None,
-        options: bool = False,
-    ) -> tuple[int, dict[str, Any]]:
-        """Choose the best allowed token; call the model only if needed.
+        extra: npt.NDArray[np.int64] | None = None,
+        labels: dict[int, str] | None = None,
+    ) -> int:
+        """Add the best allowed token to ``context`` and return it.
 
         Args:
-            context: Token ids written so far (prompt plus output).
-            allowed: Ids allowed at this step.
-            extra: More allowed ids, as an array (the large string mask).
-            options: Also report every allowed token's probability.
-
-        Returns:
-            The chosen id and a description of the step for the trace.
+            context: Token ids so far (prompt plus output); extended here.
+            allowed: The ids allowed at this step.
+            extra: More allowed ids as an array (the big string mask).
+            labels: What each allowed token stands for, shown in the trace.
         """
         ids = np.array(allowed, dtype=np.int64)
-        if extra is not None and extra.size:
+        if extra is not None:
             ids = np.concatenate([ids, extra])
         if ids.size == 0:
             raise ValueError("No token is allowed at this step")
-        if ids.size == 1:
+        if ids.size == 1:  # forced: no need to ask the model
             token = int(ids[0])
-            return token, {"id": token, "text": self._texts[token],
-                           "forced": True}
-        self._calls += 1
+            context.append(token)
+            self._record({"text": self._texts[token], "forced": True})
+            return token
         logits = np.asarray(
             self.llm.get_logits_from_input_ids(context), dtype=np.float64
         )
         masked = np.full(logits.shape, -np.inf)
-        masked[ids] = logits[ids]  # every other token is now impossible
+        masked[ids] = logits[ids]  # every other token becomes impossible
         token = int(np.argmax(masked))
-        weights = np.exp(logits[ids] - logits[token])
-        step: dict[str, Any] = {
-            "id": token,
-            "text": self._texts[token],
-            "forced": False,
-            "allowed": int(ids.size),
-            "logit": float(logits[token]),
-            "probability": float(1.0 / weights.sum()),
-        }
-        if options:
-            order = np.argsort(-logits[ids])
-            step["options"] = [
-                {
-                    "id": int(ids[i]),
-                    "text": self._texts[int(ids[i])],
-                    "logit": float(logits[ids[i]]),
-                    "probability": float(weights[i] / weights.sum()),
-                }
-                for i in order
-            ]
-        return token, step
+        context.append(token)
+        self._calls += 1
+        if self.trace_enabled:
+            weights = np.exp(logits[ids] - logits[token])
+            step: dict[str, Any] = {
+                "text": self._texts[token],
+                "forced": False,
+                "allowed": int(ids.size),
+                "probability": float(1 / weights.sum()),
+            }
+            if labels:
+                step["options"] = [
+                    {
+                        "text": self._texts[int(ids[i])],
+                        "label": labels[int(ids[i])],
+                        "probability": float(weights[i] / weights.sum()),
+                        "chosen": int(ids[i]) == token,
+                    }
+                    for i in np.argsort(-weights)[:5]
+                ]
+            self._record(step)
+        return token
 
 
 def load_functions(path: str) -> list[FunctionSchema]:

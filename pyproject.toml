@@ -25,6 +25,11 @@ explicit = true
 [tool.mypy]
 exclude = ["llm_sdk/"]
 
+[[tool.mypy.overrides]]
+# The provided SDK is not ours to change: use its types, skip its errors.
+module = ["llm_sdk", "llm_sdk.*"]
+ignore_errors = true
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -98,11 +98,11 @@ A prompt that cannot be processed is reported and skipped; the rest of the
 file is still processed and the results file is always written:
 
 ```text
-Skipped prompt 2 (''): Unsupported parameter type 'array' for 'items' in fn_sort_list
+Skipped prompt 2 (''): Unsupported parameter type 'array' for 'items'
 Skipped item 3: expected {"prompt": "..."}
 Skipped item 4: expected {"prompt": "..."}
-Skipped prompt 5 ('Sort [3, 1, 2]'): Unsupported parameter type 'array' for 'items' in fn_sort_list
-Wrote 2 call(s) to messy_out.json in 10.90 seconds; skipped 4.
+Skipped prompt 5 ('Sort [3, 1, 2]'): Unsupported parameter type 'array' for 'items'
+Wrote 2 call(s) to messy_out.json in 8.34 seconds; skipped 4.
 ```
 
 The exit code is 0 when every prompt produced a call and 1 otherwise.
@@ -168,9 +168,10 @@ the vocabulary with the project's tokenizer:
 ### Stage 1: the function name
 
 The prompt lists every function as `name(param: type, ...): description` and
-ends with `{"name": "`. The names are encoded into token sequences and form a
-trie: at each step only the next tokens of names that still match are
-allowed. For the sample functions every name starts with `fn` (forced), the
+ends with `{"name": "`. Each name, with its closing quote, is encoded into a
+token sequence, and together they form a trie: at each step only the next
+tokens of names that still match are allowed. The closing quote makes every
+sequence end differently, even when one name starts another. For the sample functions every name starts with `fn` (forced), the
 model makes **one** choice between 12 tokens (`_add`, `_g`, `_reverse`, ...),
 and the rest of the name is forced again. The LLM therefore chooses the
 function from the full list; no keyword matching is involved.
@@ -182,8 +183,10 @@ A second, shorter prompt shows only the chosen function and ends with
 the grammar of its declared type:
 
 - **number**: first ` ` or ` -`, then digits with at most one `.`, no
-  leading zeros. The token that closes the value (`,` or `}}`) is allowed
-  only once the number is complete. Output as a float.
+  leading zeros. Two regular expressions describe a number being written and
+  a finished one; a digit or `.` is allowed only if the text still matches
+  the first, and the token that closes the value (`,` or `}}`) only once it
+  matches the second. Output as a float.
 - **integer**: the same without `.`. Output as an int.
 - **boolean**: ` true` or ` false`.
 - **string**: an opening token starting with ` "`, then any content tokens.
@@ -256,12 +259,13 @@ PROMPT: Read the file at /home/user/data.json with utf-8 encoding
    ['Read', ' the', ' file', ' at', ' /', 'home', '/user', '/data', ...]
 
 2. Function name  (only the 12 defined names can be written)
-   'fn'           forced (only one name fits)
+   'fn'           forced
    12 allowed tokens, one model call:
    ► '_read'        fn_read_file                   p=100.0%  ████████████████████████
      '_get'         fn_get_square_root             p=  0.0%  ························
      ... 10 more
-   '_file'        forced (only one name fits)
+   '_file'        forced
+   '"'            forced
 
 3. Arguments  (every token must fit the parameter's type; [x] = forced)
    path: ' "/' 100% of 120  'home' 100% of 145,766  '/user' 100% of
@@ -322,10 +326,10 @@ Measured on the cluster CPU with `Qwen/Qwen3-0.6B`:
   a template that lost its inner quotes (`Say hello to {name}`).
 - In the second set, the only miss is "Is the statement 'the sky is green'
   true?", sent to `fn_is_even` instead of `fn_extract_boolean`.
-- **Speed:** 216 s for the 22 sample prompts, about 225 model calls. Numbers
-  cost one call per digit and strings one call per token, so a call takes
-  from 3 s (`Is 7 an even number?`) to 25 s (compound interest with three
-  long numbers). Start-up adds about 36 s: 24 s to import torch and
+- **Speed:** 190 to 216 s for the 22 sample prompts (225 model calls),
+  depending on the run. Numbers cost one call per digit and strings one call
+  per token, so a call takes from 3 s (`Is 7 an even number?`) to 25 s
+  (compound interest with three long numbers). Start-up adds about 36 s: 24 s to import torch and
   transformers, 9 s to load the model and 3.6 s to build the tokenizer and
   masks.
 - **Reliability:** every output is valid JSON with the schema's types, since

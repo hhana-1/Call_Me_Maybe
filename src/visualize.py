@@ -6,7 +6,6 @@ from typing import Any
 
 _WIDTH = 72
 _BAR_WIDTH = 24
-_SHOWN_OPTIONS = 5
 
 
 def _bar(probability: float) -> str:
@@ -15,57 +14,49 @@ def _bar(probability: float) -> str:
     return "█" * filled + "·" * (_BAR_WIDTH - filled)
 
 
-def _name_lines(trace: dict[str, Any]) -> list[str]:
-    """Describe how the function name was decoded through the name trie."""
-    lines = [
-        f"2. Function name  (only the {trace['function_count']} defined "
-        "names can be written)"
-    ]
-    for step in trace["name_steps"]:
+def _name_lines(steps: list[dict[str, Any]], count: int) -> list[str]:
+    """Show how the name was written: forced tokens and the model's choice."""
+    lines = [f"2. Function name  (only the {count} defined names can be "
+             "written)"]
+    for step in steps:
         if step["forced"]:
-            lines.append(f"   {step['text']!r:14} forced (only one name fits)")
+            lines.append(f"   {step['text']!r:14} forced")
             continue
-        lines.append(
-            f"   {step['allowed']} allowed tokens, one model call:"
-        )
-        options = step["options"]
-        for option in options[:_SHOWN_OPTIONS]:
-            marker = "►" if option["id"] == step["id"] else " "
-            names = ", ".join(option["functions"])
+        lines.append(f"   {step['allowed']} allowed tokens, one model call:")
+        for option in step["options"]:
+            marker = "►" if option["chosen"] else " "
             lines.append(
-                f"   {marker} {option['text']!r:14} {names[:30]:30} "
-                f"p={option['probability']:6.1%}  "
+                f"   {marker} {option['text']!r:14} {option['label'][:30]:30}"
+                f" p={option['probability']:6.1%}  "
                 f"{_bar(option['probability'])}"
             )
-        if len(options) > _SHOWN_OPTIONS:
-            lines.append(f"     ... {len(options) - _SHOWN_OPTIONS} more")
+        hidden = step["allowed"] - len(step["options"])
+        if hidden > 0:
+            lines.append(f"     ... {hidden} more")
     return lines
 
 
-def _argument_lines(trace: dict[str, Any]) -> list[str]:
+def _argument_lines(steps: list[dict[str, Any]]) -> list[str]:
     """List each argument's tokens: [forced] or chosen with probability."""
-    lines = [
-        "3. Arguments  (every token must fit the parameter's type; "
-        "[x] = forced)"
-    ]
+    lines = ["3. Arguments  (every token must fit the parameter's type; "
+             "[x] = forced)"]
     fields: dict[str, list[str]] = {}
-    for step in trace["argument_steps"]:
+    for step in steps:
         text = repr(step["text"])
-        piece = (
+        fields.setdefault(step["field"], []).append(
             f"[{text}]" if step["forced"]
             else f"{text} {step['probability']:.0%} of {step['allowed']:,}"
         )
-        fields.setdefault(step["field"], []).append(piece)
     if not fields:
         lines.append("   (no parameters)")
     for field, pieces in fields.items():
-        lines.extend(textwrap.wrap(
+        lines += textwrap.wrap(
             "  ".join(pieces),
             width=_WIDTH,
             initial_indent=f"   {field}: ",
             subsequent_indent=" " * (5 + len(field)),
             break_long_words=False,
-        ))
+        )
     return lines
 
 
@@ -81,12 +72,10 @@ def render_generation(
     Returns:
         A multi-line string visualising each generation step.
     """
-    tokens = trace.get("prompt_tokens") or []
-    forced = sum(
-        step["forced"]
-        for step in trace["name_steps"] + trace["argument_steps"]
-    )
-    lines = [
+    steps = trace["steps"]
+    tokens = trace["prompt_tokens"]
+    forced = sum(step["forced"] for step in steps)
+    return "\n".join([
         "═" * _WIDTH,
         f"PROMPT: {trace['prompt']}",
         "─" * _WIDTH,
@@ -94,14 +83,14 @@ def render_generation(
         *textwrap.wrap(repr(tokens), width=_WIDTH, initial_indent="   ",
                        subsequent_indent="   "),
         "",
-        *_name_lines(trace),
+        *_name_lines([s for s in steps if s["field"] == "name"],
+                     trace["function_count"]),
         "",
-        *_argument_lines(trace),
+        *_argument_lines([s for s in steps if s["field"] != "name"]),
         "",
         "4. Result",
         f"   {trace['selected']} "
         f"{json.dumps(parameters, ensure_ascii=False)}",
         f"   {trace['model_calls']} model calls, {forced} forced tokens",
         "═" * _WIDTH,
-    ]
-    return "\n".join(lines)
+    ])
