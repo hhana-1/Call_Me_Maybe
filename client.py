@@ -1,18 +1,14 @@
-"""Constrained decoding of function calls, one token at a time.
+"""Choose the function, then extract its arguments with regex.
 
-The model writes each call as JSON::
-
-    {"name": "fn_add_numbers", "arguments": {"a": 2, "b": 3}}
-
-At every step only the tokens that keep this text valid, and true to the
-function's schema, are allowed: every other logit is set to minus infinity.
-When just one token is allowed it is added without calling the model.
-
-Two prompts keep each model call short:
-
-1. **Name**: the prompt lists every function; the model writes one name.
-2. **Arguments**: the prompt shows only the chosen function; each value is
-   written under the rules of its type (number, integer, boolean, string).
+1. **Shortlist, keyword ranking**: ``choose_tokenizer.rank_schema_candidates``
+   scores every function by shared words and domains and keeps the best.
+2. **Function name, constrained decoding**: the prompt lists the shortlisted
+   functions and the model writes the name one token at a time. Only tokens
+   that continue a shortlisted name are allowed: every other logit is set to
+   minus infinity. When just one token is allowed it is added without
+   calling the model.
+3. **Arguments, regular expressions**: numbers, quoted strings, paths and
+   booleans are read from the prompt in the order the schema lists them.
 """
 
 import json
@@ -20,30 +16,15 @@ import re
 from typing import Any, Sequence
 
 import numpy as np
-import numpy.typing as npt
 from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
 
+from choose_tokenizer import rank_schema_candidates
 from src.schema import FunctionCall, FunctionSchema
 from src.tokenizer import BPETokenizer
-
-MAX_STRING_TOKENS = 48
-MAX_NUMBER_CHARS = 40
-JSON_ESCAPES = '"\\/bfnrt'
-
-# A number written so far ("", "-", "12", "12.", "12.5") and a finished one.
-NUMBER_PREFIX = re.compile(r"-?((0|[1-9][0-9]*)(\.[0-9]*)?)?")
-NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
-INTEGER_PREFIX = re.compile(r"-?(0|[1-9][0-9]*)?")
-INTEGER = re.compile(r"-?(0|[1-9][0-9]*)")
 
 PICK_FUNCTION = (
     "You call functions. Pick the one function whose description matches "
     "what the user asks for, and reply with the call as JSON.\n\nFunctions:\n"
-)
-FILL_ARGUMENTS = (
-    "You call functions. Fill in the arguments of this function with the "
-    "values the user asks for, and reply with the call as JSON.\n\n"
-    "Function:\n"
 )
 
 
@@ -76,33 +57,8 @@ def chat(tokenizer: BPETokenizer, system: str, user: str, answer: str
     return tokenizer.encode(text + answer)
 
 
-def scan_string(text: str, escaped: bool) -> tuple[bool, bool, str | None]:
-    """Check a token's text written inside a JSON string.
-
-    Args:
-        text: The token's text.
-        escaped: Whether the string so far ends with an unfinished ``\\``.
-
-    Returns:
-        ``(valid, escaped, rest)``: ``rest`` is the text after the closing
-        quote, or None if the string is still open.
-    """
-    for index, char in enumerate(text):
-        if escaped:
-            if char not in JSON_ESCAPES:
-                return False, False, None
-            escaped = False
-        elif char == "\\":
-            escaped = True
-        elif char == '"':
-            return True, False, text[index + 1:]
-        elif ord(char) < 0x20:
-            return False, False, None
-    return True, escaped, None
-
-
 class TokenAwareConstrainedRouter(BaseModel):
-    """Generate schema-valid function calls with constrained decoding.
+    """Choose functions with constrained decoding; extract their arguments.
 
     Attributes:
         llm: The SDK model; only ``get_logits_from_input_ids`` is used.
@@ -118,46 +74,16 @@ class TokenAwareConstrainedRouter(BaseModel):
     trace_enabled: bool = False
     last_trace: dict[str, Any] | None = None
 
-    _texts: list[str] = PrivateAttr(default_factory=list)
-    _plain_ids: npt.NDArray[np.int64] = PrivateAttr(
-        default_factory=lambda: np.zeros(0, dtype=np.int64)
-    )
-    _quote_ids: list[int] = PrivateAttr(default_factory=list)
-    _opening_ids: list[int] = PrivateAttr(default_factory=list)
-    _char_ids: dict[int, str] = PrivateAttr(default_factory=dict)
-    _sign_ids: dict[int, str] = PrivateAttr(default_factory=dict)
-    _endings: dict[str, list[int]] = PrivateAttr(default_factory=dict)
     _steps: list[dict[str, Any]] = PrivateAttr(default_factory=list)
-    _field: str = PrivateAttr(default="name")
     _calls: int = PrivateAttr(default=0)
 
     @field_validator("llm")
     @classmethod
     def _check_llm(cls, value: Any) -> Any:
-        """Require the SDK method the decoder relies on."""
+        """Require the SDK method the router relies on."""
         if not callable(getattr(value, "get_logits_from_input_ids", None)):
             raise ValueError("Model must provide get_logits_from_input_ids()")
         return value
-
-    def model_post_init(self, __context: Any) -> None:
-        """Decode every token once and sort the tokens into masks."""
-        size = max(self.tokenizer.vocab.values()) + 1
-        self._texts = [self.tokenizer.token_text(i) for i in range(size)]
-        plain = []
-        for index, text in enumerate(self._texts):
-            if not text or "�" in text or min(map(ord, text)) < 0x20:
-                continue  # empty, half a character, or a control character
-            if '"' in text or "\\" in text:
-                self._quote_ids.append(index)
-            else:
-                plain.append(index)
-        self._plain_ids = np.array(plain, dtype=np.int64)
-        self._opening_ids = [
-            index for index in self._quote_ids
-            if self._texts[index].startswith(' "')
-        ]
-        self._char_ids = {self._single_id(c): c for c in "0123456789."}
-        self._sign_ids = {self._single_id(" "): "", self._single_id(" -"): "-"}
 
     def generate_call(
         self, prompt: str, functions: Sequence[FunctionSchema]
@@ -165,42 +91,33 @@ class TokenAwareConstrainedRouter(BaseModel):
         """Generate one validated function call for ``prompt``.
 
         Raises:
-            ValueError: If no functions are given or a parameter type is not
-                supported.
+            ValueError: If no functions are given, or an argument cannot be
+                found in the prompt.
         """
         if not functions:
             raise ValueError("No function definitions were provided")
-        self._steps, self._calls, self._field = [], 0, "name"
+        self._steps, self._calls = [], 0
 
-        # Stage 1: the name. The closing quote makes every choice end
-        # differently, even when one name starts another (fn_read, fn_read_x).
+        # The keyword ranker shortlists the functions with the best score.
+        shortlist = {
+            schema["name"] for schema in rank_schema_candidates(
+                prompt, [function.model_dump() for function in functions]
+            )
+        }
+        candidates = [f for f in functions if f.name in shortlist]
+
+        # The model writes one of the shortlisted names. The closing quote
+        # makes every name end differently, even when one name starts
+        # another (fn_read, fn_read_file).
         context = chat(
             self.tokenizer,
-            PICK_FUNCTION + "\n".join(map(describe, functions)),
+            PICK_FUNCTION + "\n".join(map(describe, candidates)),
             prompt,
             '{"name": "',
         )
-        name = self._choose_text(context, [f'{f.name}"' for f in functions])
-        function = next(f for f in functions if f'{f.name}"' == name)
-
-        # Stage 2: the arguments, in the order the schema lists them.
-        parameters: dict[str, Any] = {}
-        keys = list(function.parameters)
-        if keys:
-            context = chat(
-                self.tokenizer,
-                FILL_ARGUMENTS + describe(function),
-                prompt,
-                f'{{"name": {json.dumps(function.name)}, "arguments": '
-                f"{{{json.dumps(keys[0])}:",
-            )
-        for position, key in enumerate(keys):
-            self._field = key
-            last = position + 1 == len(keys)
-            ending = "}}" if last else f", {json.dumps(keys[position + 1])}:"
-            parameters[key] = self._value(
-                context, function.parameters[key].get("type"), ending
-            )
+        name = self._choose_text(context, [f'{f.name}"' for f in candidates])
+        function = next(f for f in candidates if f'{f.name}"' == name)
+        parameters = self.extract_arguments(prompt, function)
 
         if self.trace_enabled:
             self.last_trace = {
@@ -210,6 +127,7 @@ class TokenAwareConstrainedRouter(BaseModel):
                     for i in self.tokenizer.encode(prompt)
                 ],
                 "function_count": len(functions),
+                "shortlist": [f.name for f in candidates],
                 "selected": function.name,
                 "steps": self._steps,
                 "model_calls": self._calls,
@@ -218,19 +136,7 @@ class TokenAwareConstrainedRouter(BaseModel):
             prompt=prompt, name=function.name, parameters=parameters
         )
 
-    def _value(self, context: list[int], kind: Any, ending: str) -> Any:
-        """Decode one argument value, then add the JSON that follows it."""
-        if kind in ("number", "integer"):
-            return self._number(context, kind == "integer", ending)
-        if kind == "string":
-            return self._string(context, ending)
-        if kind == "boolean":
-            word = self._choose_text(context, [" true", " false"])
-            self._force(context, ending)
-            return word == " true"
-        raise ValueError(
-            f"Unsupported parameter type {kind!r} for {self._field!r}"
-        )
+    # ----- the function name: constrained decoding ------------------------
 
     def _choose_text(self, context: list[int], choices: list[str]) -> str:
         """Let the model write exactly one of ``choices``.
@@ -252,123 +158,28 @@ class TokenAwareConstrainedRouter(BaseModel):
                 token: ", ".join(text.strip(' "') for text in texts)
                 for token, texts in branches.items()
             }
-            written.append(self._pick(context, list(branches), labels=labels))
-
-    def _number(self, context: list[int], integer: bool, ending: str
-                ) -> int | float:
-        """Decode a JSON number: a sign, digits and, unless integer, one dot.
-
-        It starts with `` `` or `` -``: Qwen writes space + minus as one
-        token, so a forced space would make negative numbers unlikely.
-        """
-        prefix, finished = (
-            (INTEGER_PREFIX, INTEGER) if integer else (NUMBER_PREFIX, NUMBER)
-        )
-        text = self._sign_ids[self._pick(context, list(self._sign_ids))]
-        while True:
-            complete = finished.fullmatch(text) is not None
-            room = len(text) < MAX_NUMBER_CHARS or not complete
-            chars = {
-                token: char for token, char in self._char_ids.items()
-                if room and prefix.fullmatch(text + char)
-            }
-            allowed = list(chars) + (self._ending_ids(ending) if complete
-                                     else [])
-            token = self._pick(context, allowed)
-            if token not in chars:  # the value ended with the next JSON
-                self._force(context, ending[len(self._texts[token]):])
-                return int(text) if integer else float(text)
-            text += chars[token]
-
-    def _string(self, context: list[int], ending: str) -> str:
-        """Decode a JSON string, checking escapes as they are written.
-
-        The first token must start with `` "``: Qwen merges the quote with
-        what follows (`` "/``, `` "[``), so a forced lone quote would keep
-        the model from writing ``/home`` or ``[aeiou]``. After
-        ``MAX_STRING_TOKENS`` tokens only a closing quote is allowed.
-        """
-        written, escaped = "", False
-        for count in range(MAX_STRING_TOKENS + 1):
-            skip = 2 if count == 0 else 0  # leave out the opening ' "'
-            must_close = count == MAX_STRING_TOKENS
-            allowed = []
-            for token in self._opening_ids if count == 0 else self._quote_ids:
-                text = self._texts[token][skip:]
-                valid, _, rest = scan_string(text, escaped)
-                if valid and (
-                    ending.startswith(rest) if rest is not None
-                    else not must_close
-                ):
-                    allowed.append(token)
-            plain = None if skip or escaped or must_close else self._plain_ids
-            token = self._pick(context, allowed, plain)
-            piece = self._texts[token][skip:]
-            _, escaped, rest = scan_string(piece, escaped)
-            if rest is None:
-                written += piece
-                continue
-            written += piece[:len(piece) - len(rest) - 1]
-            self._force(context, ending[len(rest):])
-            value: str = json.loads(f'"{written}"')
-            return value
-        raise ValueError("The string value did not end")
-
-    def _ending_ids(self, ending: str) -> list[int]:
-        """Tokens whose text starts the JSON that follows a value."""
-        if ending not in self._endings:
-            self._endings[ending] = [
-                token for token, text in enumerate(self._texts)
-                if text and ending.startswith(text)
-            ]
-        return self._endings[ending]
-
-    def _single_id(self, text: str) -> int:
-        """The id of ``text``, which must be exactly one token."""
-        ids = self.tokenizer.encode(text)
-        if len(ids) != 1:
-            raise ValueError(f"Tokenizer has no single token for {text!r}")
-        return ids[0]
-
-    def _force(self, context: list[int], text: str) -> None:
-        """Add fixed JSON structure without calling the model."""
-        for token in self.tokenizer.encode(text):
-            context.append(token)
-            self._record({"text": self._texts[token], "forced": True})
-
-    def _record(self, step: dict[str, Any]) -> None:
-        """Remember a step for the trace."""
-        if self.trace_enabled:
-            self._steps.append({"field": self._field, **step})
+            written.append(self._pick(context, list(branches), labels))
 
     def _pick(
-        self,
-        context: list[int],
-        allowed: list[int],
-        extra: npt.NDArray[np.int64] | None = None,
-        labels: dict[int, str] | None = None,
+        self, context: list[int], allowed: list[int], labels: dict[int, str]
     ) -> int:
         """Add the best allowed token to ``context`` and return it.
 
         Args:
             context: Token ids so far (prompt plus output); extended here.
             allowed: The ids allowed at this step.
-            extra: More allowed ids as an array (the big string mask).
             labels: What each allowed token stands for, shown in the trace.
         """
-        ids = np.array(allowed, dtype=np.int64)
-        if extra is not None:
-            ids = np.concatenate([ids, extra])
-        if ids.size == 0:
-            raise ValueError("No token is allowed at this step")
-        if ids.size == 1:  # forced: no need to ask the model
-            token = int(ids[0])
+        if len(allowed) == 1:  # forced: no need to ask the model
+            token = allowed[0]
             context.append(token)
-            self._record({"text": self._texts[token], "forced": True})
+            self._record({"text": self.tokenizer.token_text(token),
+                          "forced": True})
             return token
         logits = np.asarray(
             self.llm.get_logits_from_input_ids(context), dtype=np.float64
         )
+        ids = np.array(allowed, dtype=np.int64)
         masked = np.full(logits.shape, -np.inf)
         masked[ids] = logits[ids]  # every other token becomes impossible
         token = int(np.argmax(masked))
@@ -376,24 +187,160 @@ class TokenAwareConstrainedRouter(BaseModel):
         self._calls += 1
         if self.trace_enabled:
             weights = np.exp(logits[ids] - logits[token])
-            step: dict[str, Any] = {
-                "text": self._texts[token],
+            self._record({
+                "text": self.tokenizer.token_text(token),
                 "forced": False,
-                "allowed": int(ids.size),
+                "allowed": len(allowed),
                 "probability": float(1 / weights.sum()),
-            }
-            if labels:
-                step["options"] = [
+                "options": [
                     {
-                        "text": self._texts[int(ids[i])],
+                        "text": self.tokenizer.token_text(int(ids[i])),
                         "label": labels[int(ids[i])],
                         "probability": float(weights[i] / weights.sum()),
                         "chosen": int(ids[i]) == token,
                     }
                     for i in np.argsort(-weights)[:5]
-                ]
-            self._record(step)
+                ],
+            })
         return token
+
+    def _record(self, step: dict[str, Any]) -> None:
+        """Remember a step for the trace."""
+        if self.trace_enabled:
+            self._steps.append({"field": "name", **step})
+
+    # ----- the arguments: regular expressions -----------------------------
+
+    def extract_arguments(
+        self, prompt: str, function: FunctionSchema
+    ) -> dict[str, Any]:
+        """Extract values conservatively according to the function schema."""
+        numbers = [float(value) for value in re.findall(
+            r"(?<![\w.])-?\d+(?:\.\d+)?", prompt
+        )]
+        quoted = [match[1] for match in re.findall(
+            r"(['\"])(.*?)(?<!\\)\1", prompt
+        )]
+        arguments: dict[str, Any] = {}
+        number_index = 0
+        string_index = 0
+
+        for name, specification in function.parameters.items():
+            parameter_type = specification.get("type")
+            if parameter_type == "number":
+                # Numbers in prompt order, ignoring digits inside words.
+                if number_index >= len(numbers):
+                    raise ValueError(f"Missing number argument: {name}")
+                value = numbers[number_index]
+                arguments[name] = int(value) if value.is_integer() else value
+                number_index += 1
+            elif parameter_type == "integer":
+                if number_index >= len(numbers):
+                    raise ValueError(f"Missing integer argument: {name}")
+                value = numbers[number_index]
+                if not value.is_integer():
+                    raise ValueError(f"Integer argument must be whole: {name}")
+                arguments[name] = int(value)
+                number_index += 1
+            elif parameter_type == "string":
+                arguments[name] = self._string_argument(
+                    prompt, name, quoted, string_index
+                )
+                string_index += 1
+            elif parameter_type == "boolean":
+                match = re.search(r"\b(true|false)\b", prompt, re.IGNORECASE)
+                if match is not None:
+                    arguments[name] = match.group(1).lower() == "true"
+                else:
+                    math_result = self._math_boolean_result(prompt)
+                    if math_result is None:
+                        raise ValueError(f"Missing boolean argument: {name}")
+                    arguments[name] = math_result
+            else:
+                raise ValueError(
+                    f"Unsupported parameter type: {parameter_type}"
+                )
+
+        return arguments
+
+    @staticmethod
+    def _math_boolean_result(prompt: str) -> bool | None:
+        """Evaluate simple even/odd questions without using the model."""
+        match = re.search(
+            r"\b(?:is|are)\s+(-?\d+(?:\.\d+)?)\s+(?:a|an)\s+"
+            r"(even|odd)(?:\s+number)?\b",
+            prompt,
+            re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        value = float(match.group(1))
+        if not value.is_integer():
+            raise ValueError("Even/odd checks require an integer")
+        is_even = int(value) % 2 == 0
+        return is_even if match.group(2).lower() == "even" else not is_even
+
+    @staticmethod
+    def _string_argument(
+        prompt: str, name: str, quoted: list[str], index: int
+    ) -> str:
+        """Handle quoted values and the subject's natural-language patterns."""
+        if name == "regex":
+            if re.search(r"number", prompt, re.IGNORECASE):
+                return r"\d+"
+            if re.search(r"vowel", prompt, re.IGNORECASE):
+                return r"[aeiou]"
+            match = re.search(r"word ['\"]([^'\"]+)", prompt, re.IGNORECASE)
+            if match:
+                return re.escape(match.group(1))
+        if name == "replacement":
+            match = re.search(
+                r"with\s+(.+?)(?:\s+in\s+|$)", prompt, re.IGNORECASE
+            )
+            if match:
+                return match.group(1).strip(" '\"")
+            if re.search(r"asterisk", prompt, re.IGNORECASE):
+                return "*"
+        if name == "source_string":
+            match = re.search(r"in\s+(['\"])(.*?)\1", prompt, re.IGNORECASE)
+            if match:
+                return match.group(2)
+        if name == "path":
+            path_candidates: list[str] = [
+                token.strip(" '\"")
+                for token in re.findall(r"[^\s,;]+", prompt)
+                if TokenAwareConstrainedRouter._looks_like_path(token)
+            ]
+            if path_candidates:
+                return path_candidates[0]
+        if name == "encoding":
+            match = re.search(
+                r"(?:with|using)\s+([A-Za-z0-9_.-]+)\s+encoding\b|"
+                r"\bencoding\s*[:=]\s*([A-Za-z0-9_.-]+)",
+                prompt,
+                re.IGNORECASE,
+            )
+            if match:
+                return (match.group(1) or match.group(2)).lower()
+        if index < len(quoted):
+            return quoted[index]
+        words: list[str] = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", prompt)
+        if not words:
+            raise ValueError(f"Missing string argument: {name}")
+        return words[-1]
+
+    @staticmethod
+    def _looks_like_path(value: str) -> bool:
+        """Recognize common path shapes across operating systems."""
+        return bool(
+            re.fullmatch(
+                r"(?:[A-Za-z]:[\\/][^\s,;]+|"
+                r"(?:/|\./|\.\./|~/)[^\s,;]+|"
+                r"[\w.-]+(?:[\\/][\w .-]+)+|"
+                r"[\w.-]+\.[A-Za-z0-9]+)",
+                value.strip(" '\""),
+            )
+        )
 
 
 def load_functions(path: str) -> list[FunctionSchema]:

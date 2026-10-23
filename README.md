@@ -13,16 +13,17 @@ arguments with the correct types:
 {
   "prompt": "What is the sum of 2 and 3?",
   "name": "fn_add_numbers",
-  "parameters": {"a": 2.0, "b": 3.0}
+  "parameters": {"a": 2, "b": 3}
 }
 ```
 
-A small language model (`Qwen/Qwen3-0.6B` by default) writes every call. It
-is driven by **constrained decoding**: at each step only the tokens that keep
-the output valid JSON and true to the function's schema are allowed, so every
-call is parseable and has the right argument types, even from a 0.6B model.
-The model is reached only through the provided `llm_sdk`, and text is encoded
-by the project's own tokenizer.
+A keyword ranker first shortlists the functions whose words and domain best
+match the request. A small language model (`Qwen/Qwen3-0.6B` by default) then
+chooses among them with **constrained decoding**: it writes the function name
+one token at a time, and only tokens that continue a shortlisted name are
+allowed. The arguments are read from the request with regular expressions,
+according to each parameter's type. The model is reached only through the
+provided `llm_sdk`, and text is encoded by the project's own tokenizer.
 
 ## Instructions
 
@@ -57,7 +58,7 @@ uv run python -m src \
 
 Options:
 
-- `--trace` shows each prompt's decoding step by step (see
+- `--trace` shows how each function was chosen, step by step (see
   [Generation visualization](#generation-visualization)). Also `make trace`.
 - `--model <alias or repo id>` selects another model (see below).
 
@@ -98,11 +99,11 @@ A prompt that cannot be processed is reported and skipped; the rest of the
 file is still processed and the results file is always written:
 
 ```text
-Skipped prompt 2 (''): Unsupported parameter type 'array' for 'items'
+Skipped prompt 2 (''): Unsupported parameter type: array
 Skipped item 3: expected {"prompt": "..."}
 Skipped item 4: expected {"prompt": "..."}
-Skipped prompt 5 ('Sort [3, 1, 2]'): Unsupported parameter type 'array' for 'items'
-Wrote 2 call(s) to messy_out.json in 8.34 seconds; skipped 4.
+Skipped prompt 5 ('Sort [3, 1, 2]'): Unsupported parameter type: array
+Wrote 2 call(s) to messy_out.json in 2.81 seconds; skipped 4.
 ```
 
 The exit code is 0 when every prompt produced a call and 1 otherwise.
@@ -141,71 +142,62 @@ such as TinyLlama are rejected with a clear error.
 
 ## Algorithm
 
-### Constrained decoding
+### Shortlisting: keyword ranking
 
-The model writes each call as JSON, one token at a time:
+`choose_tokenizer.rank_schema_candidates` scores every function against the
+request: shared words count, shared terms from five domain vocabularies
+(economy, database, math, boolean, prose) count more, a matching domain adds
+a bonus, and the number of numbers in the request is compared with the
+function's number parameters. The functions with the best score are kept;
+if nothing scores, all of them are kept.
 
-```text
-{"name": "fn_add_numbers", "arguments": {"a": -5, "b": 3.5}}
-```
+### Choosing the function: constrained decoding
 
-At every step the decoder builds the list of **allowed** tokens. It then takes
-the model's logits, sets every other token to minus infinity, and picks the
-highest remaining one. If exactly one token is allowed, it is appended
-**without calling the model**. Text that the schema fixes (`", "b":`, `}}`) is
-appended the same way.
+The prompt lists the shortlisted functions as
+`name(param: type, ...): description` and ends with `{"name": "`. The model
+then writes the function name one token at a time, but it may only write a
+shortlisted name:
 
-The token masks are built once at start-up, by decoding all 151,643 tokens of
-the vocabulary with the project's tokenizer:
+- Each name, with its closing quote, is encoded into a token sequence.
+  Together the sequences form a trie.
+- At each step only the next tokens of the names that still match are
+  allowed. The decoder takes the model's logits, sets every other token to
+  minus infinity, and picks the highest remaining one.
+- If exactly one token is allowed, it is appended **without calling the
+  model**.
 
-| Mask                  | Tokens                                              |
-| --------------------- | --------------------------------------------------- |
-| digits, `.` and `-`   | 12 single-character tokens                          |
-| plain string content  | 145,442 tokens without quotes or backslashes        |
-| quote and escape      | 1,226 tokens containing `"` or `\`, checked one by one |
-| string openings       | 131 tokens that start with ` "` (` "/`, ` "[`, ...) |
+When several functions are kept, the model makes the choice: for the sample
+names every name starts with `fn` (forced), the model chooses once between
+the next tokens (`_add`, `_g`, `_reverse`, ...), and the rest of the name is
+forced again. When the ranker keeps a single function, every token is forced
+and the model is not called. The closing quote makes every sequence end
+differently, even when one name starts another (`fn_read` and
+`fn_read_file`).
 
-### Stage 1: the function name
+### Extracting the arguments: regular expressions
 
-The prompt lists every function as `name(param: type, ...): description` and
-ends with `{"name": "`. Each name, with its closing quote, is encoded into a
-token sequence, and together they form a trie: at each step only the next
-tokens of names that still match are allowed. The closing quote makes every
-sequence end differently, even when one name starts another. For the sample functions every name starts with `fn` (forced), the
-model makes **one** choice between 12 tokens (`_add`, `_g`, `_reverse`, ...),
-and the rest of the name is forced again. The LLM therefore chooses the
-function from the full list; no keyword matching is involved.
+The arguments are read from the request in the order the schema lists them:
 
-### Stage 2: the arguments
+- **number**: the numbers in the request, in order, ignoring digits inside
+  words. Whole numbers are written as ints, others as floats.
+- **integer**: the same, but the number must be whole.
+- **string**: a few patterns for common parameter names (`regex`,
+  `replacement`, `source_string`, `path`, `encoding`), then the quoted parts
+  of the request in order, and finally the last word.
+- **boolean**: the word `true` or `false`, or the answer to an
+  "is N even/odd" question.
 
-A second, shorter prompt shows only the chosen function and ends with
-`{"name": "fn_...", "arguments": {"<first key>":`. Each value is decoded with
-the grammar of its declared type:
-
-- **number**: first ` ` or ` -`, then digits with at most one `.`, no
-  leading zeros. Two regular expressions describe a number being written and
-  a finished one; a digit or `.` is allowed only if the text still matches
-  the first, and the token that closes the value (`,` or `}}`) only once it
-  matches the second. Output as a float.
-- **integer**: the same without `.`. Output as an int.
-- **boolean**: ` true` or ` false`.
-- **string**: an opening token starting with ` "`, then any content tokens.
-  Backslash escapes are checked as they are written (`\"`, `\\`, `\n`, ...),
-  raw control characters are forbidden, and a closing quote may be merged
-  with the JSON that follows it (`",`, `"}}`). A string longer than 48
-  tokens is closed.
-
-Values are parsed with `json.loads`, then placed in a Pydantic `FunctionCall`
-with exactly the keys `prompt`, `name` and `parameters`, and written with
-`json.dump`. The output is therefore always valid JSON with the schema's
-types.
+If a value cannot be found, the prompt is reported and skipped (see
+[Example usage](#example-usage)). The values go into a Pydantic
+`FunctionCall` with exactly the keys `prompt`, `name` and `parameters`, which
+is written with `json.dump`, so the output is always valid JSON.
 
 ### Prompt format
 
-Prompts use the model's own chat format when its tokenizer has the special
+The prompt uses the model's own chat format when its tokenizer has the special
 tokens: `<|im_start|>` turns, an empty `<think>` block (Qwen3's "no thinking"
-mode) and Qwen's `<tool_call>` marker. A model without them gets a plain-text
-prompt instead.
+mode) and Qwen's `<tool_call>` marker. A model without them gets the same
+markers as plain text.
 
 ## Tokenizer
 
@@ -250,106 +242,120 @@ still valid and decode to the same text.
 
 ## Generation visualization
 
-`--trace` (or `make trace`) prints each prompt's decoding instead of the timing
-JSON:
+`--trace` (or `make trace`) prints how each function was chosen instead of the
+timing JSON. When the ranker keeps several functions, the model decides:
+
+```text
+PROMPT: Say hi to Alice
+1. Tokenization  (4 tokens)
+   ['Say', ' hi', ' to', ' Alice']
+
+2. Function name  (keyword ranker kept all 12 functions)
+   'fn'           forced
+   12 allowed tokens, one model call:
+   ► '_g'           fn_greet                       p= 99.9%  ████████████████████████
+     '_get'         fn_get_square_root             p=  0.1%  ························
+     '_add'         fn_add_numbers                 p=  0.0%  ························
+     '_reverse'     fn_reverse_string              p=  0.0%  ························
+     '_execute'     fn_execute_sql_query           p=  0.0%  ························
+     ... 7 more
+   'reet'         forced
+   '"'            forced
+
+3. Arguments  (read from the prompt with regular expressions)
+   name = 'Alice'  (str)
+
+4. Result
+   fn_greet {"name": "Alice"}
+   1 model calls, 3 forced tokens
+```
+
+When it keeps one, every token of the name is forced:
 
 ```text
 PROMPT: Read the file at /home/user/data.json with utf-8 encoding
-1. Tokenization  (14 tokens)
-   ['Read', ' the', ' file', ' at', ' /', 'home', '/user', '/data', ...]
-
-2. Function name  (only the 12 defined names can be written)
+2. Function name  (keyword ranker kept 1 of 12: fn_read_file)
    'fn'           forced
-   12 allowed tokens, one model call:
-   ► '_read'        fn_read_file                   p=100.0%  ████████████████████████
-     '_get'         fn_get_square_root             p=  0.0%  ························
-     ... 10 more
+   '_read'        forced
    '_file'        forced
    '"'            forced
 
-3. Arguments  (every token must fit the parameter's type; [x] = forced)
-   path: ' "/' 100% of 120  'home' 100% of 145,766  '/user' 100% of
-         145,766  '/data' 100% of 145,766  '.json' 100% of 145,766  '",'
-         100% of 145,766  [' "']  ['encoding']  ['":']
-   encoding: ' "' 100% of 112  'utf' 100% of 145,725  ...  '"}}' 83% of 145,725
+3. Arguments  (read from the prompt with regular expressions)
+   path = '/home/user/data.json'  (str)
+   encoding = 'utf-8'  (str)
 
 4. Result
    fn_read_file {"path": "/home/user/data.json", "encoding": "utf-8"}
-   12 model calls, 5 forced tokens
+   0 model calls, 4 forced tokens
 ```
 
-It shows how encoding and decoding work together with constrained decoding.
-`encode` builds the name trie and the forced JSON structure. `decode` turns
-every vocabulary id into text, which the masks are built from, and labels each
-token in the trace. Each line shows how many tokens were allowed and the
-probability of the chosen one. The trace is recorded only when `--trace` is
-given.
+It shows how encoding and decoding work together with constrained decoding:
+`encode` turns the prompt and every shortlisted name into tokens (the trie),
+and `decode` turns the allowed tokens back into text for the trace, with the
+probability the model gave each one. The trace is recorded only when
+`--trace` is given.
 
 ## Design decisions
 
-- **The model chooses, the grammar constrains.** An earlier version ranked
-  functions by keyword overlap and extracted arguments with regular
-  expressions. It reached 77% on the sample but failed on reworded prompts and
-  on unseen function files, and it contradicted the subject. Both parts were
-  replaced by constrained decoding.
-- **Two prompts instead of one.** The SDK recomputes the whole prompt for
-  every token (about 0.3 s plus 6 ms per prompt token on our CPU). Listing
-  all functions costs about 320 tokens but is needed only for the name, so
-  the arguments use a 96-token prompt with just the chosen function.
-- **Skip the model whenever possible.** Forced tokens and fixed JSON
-  structure never call the model. A typical call needs 3 to 25 model calls.
-- **Respect the tokenizer's boundaries.** Qwen merges a quote with what
-  follows it (` "/`, ` "[`, ` "\\`) and a space with a minus sign (` -`).
-  Forcing a lone ` "` made the model drop the `/` of `/home/...` and the
-  brackets of `[aeiou]`, so openings and signs are model choices.
+- **Keyword shortlist, then the model.** The ranker narrows the functions
+  down by words and domain; the model chooses among what is left, and can
+  only write a real name. A version without the shortlist let the model
+  choose among all functions on every prompt; it chose the same functions on
+  the test sets, with one model call per prompt.
+- **Regular expressions for the arguments.** Reading values from the request
+  with regex needs no model call. A version that also decoded every argument
+  with constrained decoding (see the git history) reached 20 of 22 full calls
+  on the sample but took 190 to 216 seconds, against under a second now.
 - **The model's own chat format.** Measured on the 22 sample prompts, the
   chat format chose the right function 22 times out of 22, against 20 for a
-  plain-text prompt. Qwen's full JSON tool listing was better on reworded
-  prompts but three times slower, which would break the 5-minute limit.
+  plain-text prompt.
 - **Never stop the whole run.** Input files are validated up front; each
-  prompt is then processed on its own, so a malformed item or an unsupported
-  parameter type skips only that prompt. Ctrl+C writes the results so far.
-- **Pydantic for every class**, `numpy` for the logit masks, and no use of
+  prompt is then processed on its own, so a malformed item, a missing value or
+  an unsupported parameter type skips only that prompt. Ctrl+C writes the
+  results so far.
+- **Pydantic for every class**, `numpy` for the logit mask, and no use of
   private SDK attributes.
 
 ## Performance analysis
 
 Measured on the cluster CPU with `Qwen/Qwen3-0.6B`:
 
-| Set                                            | Function  | Full call |
-| ---------------------------------------------- | --------- | --------- |
-| Sample prompts (22)                            | 22/22     | 20/22     |
-| Reworded prompts, edge cases, unseen functions | 21/22     | 21/22     |
+| Set                                            | Function | Full call |
+| ---------------------------------------------- | -------- | --------- |
+| Sample prompts (22)                            | 22/22    | 17/22     |
+| Reworded prompts, edge cases, unseen functions | -        | 16/22     |
 
-- On the sample, the two calls counted as wrong are a vowel pattern written
-  as `([aeiouAEIOU])` instead of `[aeiou]` (it matches the same vowels) and
-  a template that lost its inner quotes (`Say hello to {name}`).
-- In the second set, the only miss is "Is the statement 'the sky is green'
-  true?", sent to `fn_is_even` instead of `fn_extract_boolean`.
-- **Speed:** 190 to 216 s for the 22 sample prompts (225 model calls),
-  depending on the run. Numbers cost one call per digit and strings one call
-  per token, so a call takes from 3 s (`Is 7 an even number?`) to 25 s
-  (compound interest with three long numbers). Start-up adds about 36 s: 24 s to import torch and
-  transformers, 9 s to load the model and 3.6 s to build the tokenizer and
-  masks.
-- **Reliability:** every output is valid JSON with the schema's types, since
-  the grammar never allows anything else. No input crashed the program:
-  empty prompts, a 30-digit number, unknown function files, malformed items,
-  missing or invalid files and unsupported types all end with a result or a
-  clear message.
+- **Function choice** is right for every sample prompt. For all 22 the
+  ranker keeps a single function, so the model is not called; on the second
+  set it kept several functions for 6 prompts and the model chose.
+- **Arguments:** 17 of 22 sample calls are fully right (77%), below the
+  subject's 90% target. The misses are `database` read as `"database"`
+  instead of `production` / `system` (2), `replacement` read as
+  `"asterisks"` instead of `"*"`, and the two templates read as `"profile"`
+  and `"hello"` instead of the whole template.
+- In the second set, the email address is not found (`to` gets the subject
+  instead), `José` loses its accent, and three prompts are skipped because a
+  value is missing or not a whole number ("What is the sum of 7?", "Is 4.5 an
+  even number?", "Is the statement 'the sky is green' true?").
+- **Speed:** under a second for the 22 sample prompts (no model call), and
+  0.7 to 5 s for a prompt where the model chooses. Start-up adds about 34 s:
+  24 s to import torch and transformers, 9 s to load the model and 1 s to
+  build the tokenizer.
+- **Reliability:** every output is valid JSON with exactly the required keys.
+  No input crashed the program: missing or invalid files, malformed items,
+  missing values and unsupported types all end with a result or a clear
+  message.
 
 ## Challenges faced
 
-- **A 0.6B model and a rule against heuristics.** Keyword matching made the
-  sample look good but did not generalize. The fix was to let the model
-  choose under strict constraints, and to measure prompt formats instead of
-  guessing.
-- **Time without a cache.** Each generated token reruns the whole prompt, so
-  the design minimizes model calls: forced tokens, a short second prompt and
-  one decision for the function name.
-- **Token boundaries.** Values lost characters (`/home` became `home`, `-5`
-  lost its sign) until the decoder allowed the merged tokens the model was
-  trained on.
+- **Combining keywords and the model.** Keyword ranking is fast and right on
+  the sample, but it keeps all functions for requests it has no words for
+  ("Say hi to Alice"). The model, limited to real names, handles those.
+  Measuring prompt formats instead of guessing made its choice reliable.
+- **Time without a cache.** Each model call reruns the whole prompt (about
+  0.3 s plus 6 ms per prompt token), so the number of calls decides the run
+  time. Choosing the name needs one call; decoding every argument token by
+  token needed about ten times as many.
 - **Re-implementing the tokenizer exactly.** Matching the SDK needed the
   Unicode letter and number classes, NFC normalization (found when two lines
   of the subject text tokenized differently) and special tokens.
@@ -364,20 +370,21 @@ Measured on the cluster CPU with `Qwen/Qwen3-0.6B`:
 - **Accuracy:** the 22 sample prompts with their expected calls, 18 reworded
   and edge-case prompts (empty prompt, missing numbers, negative and 30-digit
   numbers, accents, empty strings), and a separate function file the code
-  has never seen (weather, temperature, email, word count).
+  has never seen (weather, temperature, email, word count). The same sets
+  were run on the version with full constrained decoding to compare.
 - **Error handling:** missing and invalid JSON files, a prompt file with
   non-object items and missing keys, a function with an `array` parameter, a
   broken default function file next to a valid `--functions_definition`, and
   an unknown model name.
 - **Static checks:** `make lint` and `make lint-strict` pass.
-- **By hand:** `--trace` shows every decision, which is how the boundary
-  problems above were found.
+- **By hand:** `--trace` shows how every function was chosen.
 
 ## Project structure
 
 ```text
 src/__main__.py      Command line, per-prompt error recovery
-client.py            Constrained decoder (TokenAwareConstrainedRouter)
+client.py            Function choice (constrained decoding) and regex arguments
+choose_tokenizer.py  Keyword and domain ranking that shortlists functions
 src/tokenizer.py     Own byte-level BPE tokenizer (encode / decode)
 src/schema.py        Pydantic models for definitions and calls
 src/visualize.py     --trace rendering
@@ -409,8 +416,9 @@ data/output/         Generated results (not submitted)
 AI (Claude) was used for:
 
 - the byte-level BPE tokenizer and its comparison with the SDK,
-- the constrained decoder (name trie, type grammars, chat prompts) and the
-  measurements that shaped it,
+- the constrained decoding of the function name (name trie, chat prompt) and
+  the measurements that shaped it,
+- connecting the keyword ranker to the name decoding,
 - the `--trace` visualization, per-prompt error recovery and lint fixes,
 - reviewing the project against the subject, and drafting this README.
 

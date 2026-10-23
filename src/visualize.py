@@ -14,10 +14,19 @@ def _bar(probability: float) -> str:
     return "█" * filled + "·" * (_BAR_WIDTH - filled)
 
 
-def _name_lines(steps: list[dict[str, Any]], count: int) -> list[str]:
-    """Show how the name was written: forced tokens and the model's choice."""
-    lines = [f"2. Function name  (only the {count} defined names can be "
-             "written)"]
+def _name_lines(
+    steps: list[dict[str, Any]], shortlist: list[str], count: int
+) -> list[str]:
+    """Show the keyword shortlist, then how the name was written."""
+    if len(shortlist) == count:
+        kept = f"kept all {count} functions"
+    else:
+        kept = f"kept {len(shortlist)} of {count}: {', '.join(shortlist)}"
+    lines = textwrap.wrap(
+        f"2. Function name  (keyword ranker {kept})",
+        width=_WIDTH,
+        subsequent_indent="   ",
+    )
     for step in steps:
         if step["forced"]:
             lines.append(f"   {step['text']!r:14} forced")
@@ -36,27 +45,13 @@ def _name_lines(steps: list[dict[str, Any]], count: int) -> list[str]:
     return lines
 
 
-def _argument_lines(steps: list[dict[str, Any]]) -> list[str]:
-    """List each argument's tokens: [forced] or chosen with probability."""
-    lines = ["3. Arguments  (every token must fit the parameter's type; "
-             "[x] = forced)"]
-    fields: dict[str, list[str]] = {}
-    for step in steps:
-        text = repr(step["text"])
-        fields.setdefault(step["field"], []).append(
-            f"[{text}]" if step["forced"]
-            else f"{text} {step['probability']:.0%} of {step['allowed']:,}"
-        )
-    if not fields:
+def _argument_lines(parameters: dict[str, Any]) -> list[str]:
+    """List the arguments read from the prompt, with their Python types."""
+    lines = ["3. Arguments  (read from the prompt with regular expressions)"]
+    if not parameters:
         lines.append("   (no parameters)")
-    for field, pieces in fields.items():
-        lines += textwrap.wrap(
-            "  ".join(pieces),
-            width=_WIDTH,
-            initial_indent=f"   {field}: ",
-            subsequent_indent=" " * (5 + len(field)),
-            break_long_words=False,
-        )
+    for key, value in parameters.items():
+        lines.append(f"   {key} = {value!r}  ({type(value).__name__})")
     return lines
 
 
@@ -84,9 +79,9 @@ def render_generation(
                        subsequent_indent="   "),
         "",
         *_name_lines([s for s in steps if s["field"] == "name"],
-                     trace["function_count"]),
+                     trace["shortlist"], trace["function_count"]),
         "",
-        *_argument_lines([s for s in steps if s["field"] != "name"]),
+        *_argument_lines(parameters),
         "",
         "4. Result",
         f"   {trace['selected']} "
