@@ -383,8 +383,8 @@ Measured on the cluster CPU with `Qwen/Qwen3-0.6B`:
 
 ```text
 src/__main__.py      Command line, per-prompt error recovery
-client.py            Function choice (constrained decoding) and regex arguments
-choose_tokenizer.py  Keyword and domain ranking that shortlists functions
+src/client.py        Function choice (constrained decoding) and regex arguments
+src/choose_tokenizer.py  Keyword and domain ranking that shortlists functions
 src/tokenizer.py     Own byte-level BPE tokenizer (encode / decode)
 src/schema.py        Pydantic models for definitions and calls
 src/visualize.py     --trace rendering

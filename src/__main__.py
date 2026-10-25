@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from client import TokenAwareConstrainedRouter, load_functions
+from src.client import TokenAwareConstrainedRouter, load_functions
 from llm_sdk.llm_sdk import Small_LLM_Model
 from src.models import DEFAULT_MODEL, MODEL_PRESETS, resolve_model
 from src.tokenizer import BPETokenizer

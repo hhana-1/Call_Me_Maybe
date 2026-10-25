@@ -18,7 +18,7 @@ from typing import Any, Sequence
 import numpy as np
 from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
 
-from choose_tokenizer import rank_schema_candidates
+from src.choose_tokenizer import rank_schema_candidates
 from src.schema import FunctionCall, FunctionSchema
 from src.tokenizer import BPETokenizer
 

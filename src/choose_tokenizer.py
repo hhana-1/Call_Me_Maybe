@@ -11,7 +11,7 @@ from src.tokenizer import BPETokenizer
 # 1. DATA DEFINITIONS
 # =====================================================================
 
-_ROOT = Path(__file__).resolve().parent
+_ROOT = Path(__file__).resolve().parents[1]  # the project folder
 _DATA_INPUT = _ROOT / "data" / "input"
 
 
