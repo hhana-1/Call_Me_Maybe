@@ -1,6 +1,6 @@
 """Choose the function, then extract its arguments with regex.
 
-1. **Shortlist, keyword ranking**: ``choose_tokenizer.rank_schema_candidates``
+1. **Shortlist, keyword ranking**: ``keyword_ranker.shortlist_functions``
    scores every function by shared words and domains and keeps the best.
 2. **Function name, constrained decoding**: the prompt lists the shortlisted
    functions and the model writes the name one token at a time. Only tokens
@@ -18,7 +18,7 @@ from typing import Any, Sequence
 import numpy as np
 from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
 
-from src.choose_tokenizer import rank_schema_candidates
+from src.keyword_ranker import shortlist_functions
 from src.schema import FunctionCall, FunctionSchema
 from src.tokenizer import BPETokenizer
 
@@ -41,20 +41,31 @@ def chat(tokenizer: BPETokenizer, system: str, user: str, answer: str
          ) -> list[int]:
     """Encode a prompt in Qwen's chat format, ending inside the answer.
 
-    The markers are written as text; the tokenizer turns each one into its
-    single special-token id. Qwen3 also gets an empty ``<think>`` block (no
+    Each marker is followed by its text. Only the markers become
+    special-token ids: the system text, the request and the answer start are
+    encoded as plain text, so a request containing ``<|im_start|>`` cannot
+    open a new turn. Qwen3 also gets an empty ``<think>`` block (no
     thinking) and its ``<tool_call>`` marker when the model has them.
     """
-    text = (
-        f"<|im_start|>system\n{system}<|im_end|>\n"
-        f"<|im_start|>user\n{user}<|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
+    parts = [
+        ("<|im_start|>", f"system\n{system}"),
+        ("<|im_end|>", "\n"),
+        ("<|im_start|>", f"user\n{user}"),
+        ("<|im_end|>", "\n"),
+        ("<|im_start|>", "assistant\n"),
+    ]
     if "<think>" in tokenizer.special_tokens:
-        text += "<think>\n\n</think>\n\n"
+        parts += [("<think>", "\n\n"), ("</think>", "\n\n")]
     if "<tool_call>" in tokenizer.special_tokens:
-        text += "<tool_call>\n"
-    return tokenizer.encode(text + answer)
+        parts.append(("<tool_call>", "\n"))
+    marker, text = parts.pop()
+    parts.append((marker, text + answer))  # the answer continues that text
+    return [
+        token_id
+        for marker, text in parts
+        for token_id in tokenizer.encode(marker)
+        + tokenizer.encode(text, allow_special=False)
+    ]
 
 
 class TokenAwareConstrainedRouter(BaseModel):
@@ -100,7 +111,7 @@ class TokenAwareConstrainedRouter(BaseModel):
 
         # The keyword ranker shortlists the functions with the best score.
         shortlist = {
-            schema["name"] for schema in rank_schema_candidates(
+            schema["name"] for schema in shortlist_functions(
                 prompt, [function.model_dump() for function in functions]
             )
         }
@@ -124,7 +135,7 @@ class TokenAwareConstrainedRouter(BaseModel):
                 "prompt": prompt,
                 "prompt_tokens": [
                     self.tokenizer.token_text(i)
-                    for i in self.tokenizer.encode(prompt)
+                    for i in self.tokenizer.encode(prompt, allow_special=False)
                 ],
                 "function_count": len(functions),
                 "shortlist": [f.name for f in candidates],
@@ -144,7 +155,10 @@ class TokenAwareConstrainedRouter(BaseModel):
         The choices' token sequences form a trie: at each step only the next
         tokens of the choices that still match are allowed.
         """
-        sequences = {text: self.tokenizer.encode(text) for text in choices}
+        sequences = {
+            text: self.tokenizer.encode(text, allow_special=False)
+            for text in choices
+        }
         written: list[int] = []
         while True:
             branches: dict[int, list[str]] = {}

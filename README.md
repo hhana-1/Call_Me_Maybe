@@ -144,7 +144,7 @@ such as TinyLlama are rejected with a clear error.
 
 ### Shortlisting: keyword ranking
 
-`choose_tokenizer.rank_schema_candidates` scores every function against the
+`keyword_ranker.shortlist_functions` scores every function against the
 request: shared words count, shared terms from five domain vocabularies
 (economy, database, math, boolean, prose) count more, a matching domain adds
 a bonus, and the number of numbers in the request is compared with the
@@ -194,10 +194,44 @@ is written with `json.dump`, so the output is always valid JSON.
 
 ### Prompt format
 
-The prompt uses the model's own chat format when its tokenizer has the special
-tokens: `<|im_start|>` turns, an empty `<think>` block (Qwen3's "no thinking"
-mode) and Qwen's `<tool_call>` marker. A model without them gets the same
-markers as plain text.
+`chat()` in `src/client.py` builds the prompt in the conversation layout Qwen
+was trained on. For `Say hi to Alice` (shortened here to 3 of the 12 listed
+functions), the model receives exactly this:
+
+```text
+<|im_start|>system
+You call functions. Pick the one function whose description matches what the user asks for, and reply with the call as JSON.
+
+Functions:
+- fn_add_numbers(a: number, b: number): Add two numbers together and return their sum.
+- fn_greet(name: string): Generate a greeting message for a person by name.
+- fn_reverse_string(s: string): Reverse a string and return the reversed result.<|im_end|>
+<|im_start|>user
+Say hi to Alice<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+{"name": "
+```
+
+- `<|im_start|>system`, `user` and `assistant` mark who is speaking, and
+  `<|im_end|>` ends each turn.
+- The empty `<think>` block tells Qwen3 to skip its reasoning step.
+- `<tool_call>` is the marker Qwen3 learned to write right before a function
+  call, so the model is at exactly the place where it is used to writing one.
+- `{"name": "` is the start of the answer. The program writes it, not the
+  model; the model only continues it. This is called *prefilling*: the
+  program controls the start of the answer, not just the question.
+
+The `<think>` block and `<tool_call>` are added only when the tokenizer has
+them as special tokens; for a model without `<|im_start|>` and `<|im_end|>`,
+those are written as plain text. Only the markers become special-token ids:
+the function list, the request and the answer start are encoded with
+`allow_special=False`, so a request that contains `<|im_start|>` stays plain
+text and cannot open a new turn (prompt injection).
 
 ## Tokenizer
 
@@ -216,7 +250,8 @@ tokenizer.decode([8822, 2891, 32964])   # 'fn_add_numbers'
 How `encode` works:
 
 1. **Special tokens** such as `<|im_start|>` are cut out first and become
-   their single ids.
+   their single ids. With `allow_special=False` they stay plain text, which
+   is how user and file text is encoded.
 2. **Normalize** the rest to Unicode NFC, as Qwen's tokenizer does, so a
    character written in decomposed form (`G` + a combining dot) becomes `Ġ`.
 3. **Pre-tokenize** with Qwen's split pattern: letters, single digits,
@@ -384,7 +419,7 @@ Measured on the cluster CPU with `Qwen/Qwen3-0.6B`:
 ```text
 src/__main__.py      Command line, per-prompt error recovery
 src/client.py        Function choice (constrained decoding) and regex arguments
-src/choose_tokenizer.py  Keyword and domain ranking that shortlists functions
+src/keyword_ranker.py  Keyword and domain ranking that shortlists functions
 src/tokenizer.py     Own byte-level BPE tokenizer (encode / decode)
 src/schema.py        Pydantic models for definitions and calls
 src/visualize.py     --trace rendering
@@ -414,7 +449,7 @@ data/output/         Generated results (not submitted)
 ### AI use
 
 AI (Claude) was used for:
-
+- Fixing mypy and flake8 errors
 - the byte-level BPE tokenizer and its comparison with the SDK,
 - the constrained decoding of the function name (name trie, chat prompt) and
   the measurements that shaped it,

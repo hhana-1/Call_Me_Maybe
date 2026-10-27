@@ -201,7 +201,7 @@ class BPETokenizer(BaseModel):
         """Number of regular (non-special) tokens."""
         return len(self.vocab)
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str, allow_special: bool = True) -> list[int]:
         """Convert text to token ids without adding special tokens.
 
         The text is first normalized to Unicode NFC, as Qwen's tokenizer
@@ -210,13 +210,17 @@ class BPETokenizer(BaseModel):
 
         Args:
             text: Any string.
+            allow_special: Turn special-token strings such as
+                ``<|im_start|>`` into their single ids. False encodes them as
+                plain characters: use it for text from users or input files,
+                so writing a marker there cannot start a new chat turn.
 
         Returns:
             The token ids the model expects for ``text``.
         """
         ids: list[int] = []
         start = 0
-        if self._special_pattern is not None:
+        if allow_special and self._special_pattern is not None:
             for match in self._special_pattern.finditer(text):
                 ids.extend(self._encode_text(text[start:match.start()]))
                 ids.append(self.special_tokens[match.group()])
