@@ -1,0 +1,12 @@
+[
+  {"prompt": "Give me 10 plus 20"},
+  {"prompt": "Add or multiply 2 and 3"},
+  {"prompt": "Say hi to Bob"},
+  {"prompt": "Flip the text 'banana'"},
+  {"prompt": "Turn 'stressed' backwards"},
+  {"prompt": "Mirror 'level'"},
+  {"prompt": "Put 'abc' back to front"},
+  {"prompt": "Give me 6 times 7"},
+  {"prompt": "Tell Maria good morning"},
+  {"prompt": "How much is 7 times 8?"}
+]
