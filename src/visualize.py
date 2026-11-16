@@ -28,8 +28,8 @@ def _name_lines(
         subsequent_indent="   ",
     )
     for step in steps:
-        if step["forced"]:
-            lines.append(f"   {step['text']!r:14} forced")
+        if step["fast_forward"]:
+            lines.append(f"   {step['text']!r:14} fast-forward")
             continue
         lines.append(f"   {step['allowed']} allowed tokens, one model call:")
         for option in step["options"]:
@@ -69,7 +69,7 @@ def render_generation(
     """
     steps = trace["steps"]
     tokens = trace["prompt_tokens"]
-    forced = sum(step["forced"] for step in steps)
+    fast_forward = sum(step["fast_forward"] for step in steps)
     return "\n".join([
         "═" * _WIDTH,
         f"PROMPT: {trace['prompt']}",
@@ -86,6 +86,7 @@ def render_generation(
         "4. Result",
         f"   {trace['selected']} "
         f"{json.dumps(parameters, ensure_ascii=False)}",
-        f"   {trace['model_calls']} model calls, {forced} forced tokens",
+        f"   {trace['model_calls']} model calls, "
+        f"{fast_forward} fast-forward tokens",
         "═" * _WIDTH,
     ])

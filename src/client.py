@@ -5,8 +5,8 @@
 2. **Function name, constrained decoding**: the prompt lists the shortlisted
    functions and the model writes the name one token at a time. Only tokens
    that continue a shortlisted name are allowed: every other logit is set to
-   minus infinity. When just one token is allowed it is added without
-   calling the model.
+   minus infinity. When just one token is allowed it is fast-forwarded:
+   added without calling the model.
 3. **Arguments, regular expressions**: numbers, quoted strings, paths and
    booleans are read from the prompt in the order the schema lists them.
 """
@@ -73,7 +73,7 @@ class TokenAwareConstrainedRouter(BaseModel):
 
     Attributes:
         llm: The SDK model; only ``get_logits_from_input_ids`` is used.
-        tokenizer: The project's BPE tokenizer for the same model.
+        tokenizer: The project's BPE tokenizer.
         trace_enabled: Record every decoding step in ``last_trace``.
         last_trace: Steps of the latest call, when tracing is enabled.
     """
@@ -110,6 +110,7 @@ class TokenAwareConstrainedRouter(BaseModel):
         self._steps, self._calls = [], 0
 
         # The keyword ranker shortlists the functions with the best score.
+        # Func defs are cp,exists only while shortlist_functions runs
         shortlist = {
             schema["name"] for schema in shortlist_functions(
                 prompt, [function.model_dump() for function in functions]
@@ -184,11 +185,11 @@ class TokenAwareConstrainedRouter(BaseModel):
             allowed: The ids allowed at this step.
             labels: What each allowed token stands for, shown in the trace.
         """
-        if len(allowed) == 1:  # forced: no need to ask the model
+        if len(allowed) == 1:  # fast-forward: no need to ask the model
             token = allowed[0]
             context.append(token)
             self._record({"text": self.tokenizer.token_text(token),
-                          "forced": True})
+                          "fast_forward": True})
             return token
         logits = np.asarray(
             self.llm.get_logits_from_input_ids(context), dtype=np.float64
@@ -203,7 +204,7 @@ class TokenAwareConstrainedRouter(BaseModel):
             weights = np.exp(logits[ids] - logits[token])
             self._record({
                 "text": self.tokenizer.token_text(token),
-                "forced": False,
+                "fast_forward": False,
                 "allowed": len(allowed),
                 "probability": float(1 / weights.sum()),
                 "options": [
@@ -279,7 +280,7 @@ class TokenAwareConstrainedRouter(BaseModel):
 
     @staticmethod
     def _math_boolean_result(prompt: str) -> bool | None:
-        """Evaluate simple even/odd questions without using the model."""
+        """Evaluate simple even/odd questions."""
         match = re.search(
             r"\b(?:is|are)\s+(-?\d+(?:\.\d+)?)\s+(?:a|an)\s+"
             r"(even|odd)(?:\s+number)?\b",

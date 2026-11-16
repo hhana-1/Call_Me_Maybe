@@ -69,9 +69,6 @@ def process_prompts(
 ) -> tuple[list[dict[str, Any]], int]:
     """Generate a call for every prompt, skipping the ones that fail.
 
-    One bad item never stops the run: it is reported and the next prompt is
-    processed. Ctrl+C stops early but keeps the results produced so far.
-
     Returns:
         The results, and how many prompts were skipped.
     """

@@ -163,16 +163,17 @@ shortlisted name:
 - At each step only the next tokens of the names that still match are
   allowed. The decoder takes the model's logits, sets every other token to
   minus infinity, and picks the highest remaining one.
-- If exactly one token is allowed, it is appended **without calling the
-  model**.
+- If exactly one token is allowed, it is a **fast-forward token**: it is
+  appended **without calling the model**. Calling the model could not change
+  the result, because every other token is masked out.
 
 When several functions are kept, the model makes the choice: for the sample
-names every name starts with `fn` (forced), the model chooses once between
-the next tokens (`_add`, `_g`, `_reverse`, ...), and the rest of the name is
-forced again. When the ranker keeps a single function, every token is forced
-and the model is not called. The closing quote makes every sequence end
-differently, even when one name starts another (`fn_read` and
-`fn_read_file`).
+names every name starts with `fn` (fast-forward), the model chooses once
+between the next tokens (`_add`, `_g`, `_reverse`, ...), and the rest of the
+name is fast-forwarded again. When the ranker keeps a single function, every
+token is fast-forwarded and the model is not called. The closing quote makes
+every sequence end differently, even when one name starts another (`fn_read`
+and `fn_read_file`).
 
 ### Extracting the arguments: regular expressions
 
@@ -286,7 +287,7 @@ PROMPT: Say hi to Alice
    ['Say', ' hi', ' to', ' Alice']
 
 2. Function name  (keyword ranker kept all 12 functions)
-   'fn'           forced
+   'fn'           fast-forward
    12 allowed tokens, one model call:
    ► '_g'           fn_greet                       p= 99.9%  ████████████████████████
      '_get'         fn_get_square_root             p=  0.1%  ························
@@ -294,26 +295,26 @@ PROMPT: Say hi to Alice
      '_reverse'     fn_reverse_string              p=  0.0%  ························
      '_execute'     fn_execute_sql_query           p=  0.0%  ························
      ... 7 more
-   'reet'         forced
-   '"'            forced
+   'reet'         fast-forward
+   '"'            fast-forward
 
 3. Arguments  (read from the prompt with regular expressions)
    name = 'Alice'  (str)
 
 4. Result
    fn_greet {"name": "Alice"}
-   1 model calls, 3 forced tokens
+   1 model calls, 3 fast-forward tokens
 ```
 
-When it keeps one, every token of the name is forced:
+When it keeps one, every token of the name is fast-forwarded:
 
 ```text
 PROMPT: Read the file at /home/user/data.json with utf-8 encoding
 2. Function name  (keyword ranker kept 1 of 12: fn_read_file)
-   'fn'           forced
-   '_read'        forced
-   '_file'        forced
-   '"'            forced
+   'fn'           fast-forward
+   '_read'        fast-forward
+   '_file'        fast-forward
+   '"'            fast-forward
 
 3. Arguments  (read from the prompt with regular expressions)
    path = '/home/user/data.json'  (str)
@@ -321,7 +322,7 @@ PROMPT: Read the file at /home/user/data.json with utf-8 encoding
 
 4. Result
    fn_read_file {"path": "/home/user/data.json", "encoding": "utf-8"}
-   0 model calls, 4 forced tokens
+   0 model calls, 4 fast-forward tokens
 ```
 
 It shows how encoding and decoding work together with constrained decoding:
@@ -458,3 +459,5 @@ AI (Claude) was used for:
 - reviewing the project against the subject, and drafting this README.
 
 All of it was reviewed, run and tested before submission.
+
+looking up regex
