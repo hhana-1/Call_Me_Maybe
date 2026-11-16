@@ -461,3 +461,28 @@ AI (Claude) was used for:
 All of it was reviewed, run and tested before submission.
 
 looking up regex
+
+
+<|im_start|>system
+You call functions. Pick the one function ...
+fn_add_numbers: Add two numbers together ...        ← the function descriptions
+fn_multiply_numbers: Multiply two numbers ...
+<|im_end|>
+<|im_start|>user
+What is the sum of 2 and 3?                         ← the prompt
+<|im_end|>
+<|im_start|>assistant
+<think>\n\n</think>\n\n<tool_call>\n{"name": "fn     ← what's written so far
+
+
+For the context ... What is the sum of 2 and 3? ... {"name": "fn:
+
+Step	Tensor	What happens
+1	embed_tokens [151936, 1024]	Look up, no maths: for each token id in the context, take that row. Token 2891 (_add) becomes row 2891, a vector of 1024 numbers. The context is now one vector per token.
+2a	input_layernorm [1024]	Rescale each vector so the numbers don't grow too big.
+2b	q_proj, k_proj, v_proj	Multiply each vector by these 3 tables to get 3 new vectors: a query ("what am I looking for?"), a key ("what do I contain?") and a value ("what do I pass on?").
+2c	(attention itself)	For the last token, multiply its query with every earlier token's key: a high result means "relevant". Softmax turns these into weights (the same exp idea as in your trace), then it takes a weighted sum of the values. This is how information from "sum" reaches the last position.
+2d	o_proj	Multiply the result back to 1024 numbers and add it to the vector.
+2e	mlp: gate_proj, up_proj, down_proj	Expand each vector to 3072 numbers, apply a nonlinear function (SiLU), and shrink it back to 1024. Each token is processed on its own; much of the "facts" learned in training is stored here.
+layers.1 to layers.27	Repeat 2a to 2e with that layer's own tables, 28 times in total.
+3	model.norm, then lm_head [151936, 1024]	Rescale the last token's final vector, then multiply it with every row: 151,936 results, which are the logits _pick gets.
