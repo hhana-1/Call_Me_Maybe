@@ -50,6 +50,14 @@ def parse_args() -> argparse.Namespace:
             "model chooses. Off by default: the model chooses among all."
         ),
     )
+    parser.add_argument(
+        "--regex-arguments",
+        action="store_true",
+        help=(
+            "Read the arguments from the prompt with regular expressions. "
+            "Off by default: the model writes them."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -137,6 +145,7 @@ def main() -> int:
             tokenizer=BPETokenizer.from_model(model),
             trace_enabled=args.trace,
             use_ranker=args.ranker,
+            regex_arguments=args.regex_arguments,
         )
         started = time.perf_counter()
         results, skipped = process_prompts(

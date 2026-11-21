@@ -37,27 +37,57 @@ def _name_lines(
         if step["fast_forward"]:
             lines.append(f"   {step['text']!r:14} fast-forward")
             continue
-        lines.append(f"   {step['allowed']} allowed tokens, one model call:")
-        for option in step["options"]:
-            marker = "►" if option["chosen"] else " "
-            lines.append(
-                f"   {marker} {option['text']!r:14} {option['label'][:30]:30}"
-                f" p={option['probability']:6.1%}  "
-                f"{_bar(option['probability'])}"
-            )
-        hidden = step["allowed"] - len(step["options"])
-        if hidden > 0:
-            lines.append(f"     ... {hidden} more")
+        lines.extend(_call_lines(step, "   ", 5))
     return lines
 
 
-def _argument_lines(parameters: dict[str, Any]) -> list[str]:
-    """List the arguments read from the prompt, with their Python types."""
-    lines = ["3. Arguments  (read from the prompt with regular expressions)"]
+def _call_lines(step: dict[str, Any], indent: str, limit: int) -> list[str]:
+    """Show one model call: the best allowed tokens and their probability."""
+    lines = [f"{indent}{step['allowed']} allowed tokens, one model call:"]
+    for option in step["options"][:limit]:
+        marker = "►" if option["chosen"] else " "
+        lines.append(
+            f"{indent}{marker} {option['text']!r:14} "
+            f"{option['label'][:30]:30} p={option['probability']:6.1%}  "
+            f"{_bar(option['probability'])}"
+        )
+    hidden = step["allowed"] - min(limit, len(step["options"]))
+    if hidden > 0:
+        lines.append(f"{indent}  ... {hidden} more")
+    return lines
+
+
+def _argument_lines(
+    parameters: dict[str, Any], steps: list[dict[str, Any]], by: str
+) -> list[str]:
+    """List the arguments with their Python types, and how each was written.
+
+    Consecutive fast-forward tokens are shown together on one line.
+    """
+    if by == "regex":
+        lines = ["3. Arguments  (read from the prompt with regular "
+                 "expressions)"]
+    else:
+        lines = ["3. Arguments  (written by the model; each parameter's "
+                 "type limits the tokens)"]
     if not parameters:
         lines.append("   (no parameters)")
     for key, value in parameters.items():
         lines.append(f"   {key} = {value!r}  ({type(value).__name__})")
+        forwarded: list[str] = []
+        for step in [s for s in steps if s["argument"] == key] + [None]:
+            if step is not None and step["fast_forward"]:
+                forwarded.append(step["text"])
+                continue
+            if forwarded:
+                count = len(forwarded)
+                lines.append(
+                    f"      {''.join(forwarded)!r} fast-forward"
+                    f" ({count} token{'' if count == 1 else 's'})"
+                )
+                forwarded = []
+            if step is not None:
+                lines.extend(_call_lines(step, "      ", 3))
     return lines
 
 
@@ -84,11 +114,11 @@ def render_generation(
         *textwrap.wrap(repr(tokens), width=_WIDTH, initial_indent="   ",
                        subsequent_indent="   "),
         "",
-        *_name_lines([s for s in steps if s["field"] == "name"],
+        *_name_lines([s for s in steps if s["argument"] is None],
                      trace["shortlist"], trace["function_count"],
                      trace["ranker"]),
         "",
-        *_argument_lines(parameters),
+        *_argument_lines(parameters, steps, trace["arguments_by"]),
         "",
         "4. Result",
         f"   {trace['selected']} "
