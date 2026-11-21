@@ -1,17 +1,18 @@
 """Choose the function, then extract its arguments with regex.
 
-1. **Shortlist, keyword ranking**: ``keyword_ranker.shortlist_functions``
-   scores every function by shared words and domains and keeps the best.
-2. **Function name, constrained decoding**: the prompt lists the shortlisted
+1. **Shortlist, keyword ranking** (optional, off by default):
+   ``keyword_ranker.shortlist_functions`` scores every function by shared
+   words and domains and keeps the best. When it is off, every function is a
+   candidate.
+2. **Function name, constrained decoding**: the prompt lists the candidate
    functions and the model writes the name one token at a time. Only tokens
-   that continue a shortlisted name are allowed: every other logit is set to
+   that continue a candidate's name are allowed: every other logit is set to
    minus infinity. When just one token is allowed it is fast-forwarded:
    added without calling the model.
 3. **Arguments, regular expressions**: numbers, quoted strings, paths and
    booleans are read from the prompt in the order the schema lists them.
 """
 
-import json
 import re
 from typing import Any, Sequence
 
@@ -29,12 +30,12 @@ PICK_FUNCTION = (
 
 
 def describe(function: FunctionSchema) -> str:
-    """Render a function as ``- name(a: number, b: string): description``."""
-    parameters = ", ".join(
-        f"{key}: {spec.get('type', 'unknown')}"
-        for key, spec in function.parameters.items()
-    )
-    return f"- {function.name}({parameters}): {function.description}"
+    """Render a function as ``- name: description`` for the model.
+
+    The parameter list is left out: the model only chooses the name, and the
+    shorter prompt makes every model call faster.
+    """
+    return f"- {function.name}: {function.description}"
 
 
 def chat(tokenizer: BPETokenizer, system: str, user: str, answer: str
@@ -75,6 +76,8 @@ class TokenAwareConstrainedRouter(BaseModel):
         llm: The SDK model; only ``get_logits_from_input_ids`` is used.
         tokenizer: The project's BPE tokenizer.
         trace_enabled: Record every decoding step in ``last_trace``.
+        use_ranker: Shortlist the functions with the keyword ranker before
+            the model chooses. Off by default: the model chooses among all.
         last_trace: Steps of the latest call, when tracing is enabled.
     """
 
@@ -83,6 +86,7 @@ class TokenAwareConstrainedRouter(BaseModel):
     llm: Any
     tokenizer: BPETokenizer
     trace_enabled: bool = False
+    use_ranker: bool = False
     last_trace: dict[str, Any] | None = None
 
     _steps: list[dict[str, Any]] = PrivateAttr(default_factory=list)
@@ -109,16 +113,20 @@ class TokenAwareConstrainedRouter(BaseModel):
             raise ValueError("No function definitions were provided")
         self._steps, self._calls = [], 0
 
-        # The keyword ranker shortlists the functions with the best score.
-        # Func defs are cp,exists only while shortlist_functions runs
-        shortlist = {
-            schema["name"] for schema in shortlist_functions(
-                prompt, [function.model_dump() for function in functions]
-            )
-        }
-        candidates = [f for f in functions if f.name in shortlist]
+        if self.use_ranker:
+            # The keyword ranker shortlists the functions with the best score.
+            # Func defs are cp,exists only while shortlist_functions runs
+            shortlist = {
+                schema["name"] for schema in shortlist_functions(
+                    prompt, [function.model_dump() for function in functions]
+                )
+            }
+            candidates = [f for f in functions if f.name in shortlist]
+        else:
+            # Without the ranker the model chooses among all the functions.
+            candidates = list(functions)
 
-        # The model writes one of the shortlisted names. The closing quote
+        # The model writes one of the candidates' names. The closing quote
         # makes every name end differently, even when one name starts
         # another (fn_read, fn_read_file).
         context = chat(
@@ -139,6 +147,7 @@ class TokenAwareConstrainedRouter(BaseModel):
                     for i in self.tokenizer.encode(prompt, allow_special=False)
                 ],
                 "function_count": len(functions),
+                "ranker": self.use_ranker,
                 "shortlist": [f.name for f in candidates],
                 "selected": function.name,
                 "steps": self._steps,
@@ -147,8 +156,6 @@ class TokenAwareConstrainedRouter(BaseModel):
         return FunctionCall(
             prompt=prompt, name=function.name, parameters=parameters
         )
-
-    # ----- the function name: constrained decoding ------------------------
 
     def _choose_text(self, context: list[int], choices: list[str]) -> str:
         """Let the model write exactly one of ``choices``.
@@ -356,12 +363,3 @@ class TokenAwareConstrainedRouter(BaseModel):
                 value.strip(" '\""),
             )
         )
-
-
-def load_functions(path: str) -> list[FunctionSchema]:
-    """Load and validate function definitions from JSON."""
-    with open(path, encoding="utf-8") as handle:
-        raw = json.load(handle)
-    if not isinstance(raw, list):
-        raise ValueError("Function definitions must be a JSON array")
-    return [FunctionSchema.model_validate(item) for item in raw]

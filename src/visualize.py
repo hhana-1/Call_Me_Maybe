@@ -15,15 +15,21 @@ def _bar(probability: float) -> str:
 
 
 def _name_lines(
-    steps: list[dict[str, Any]], shortlist: list[str], count: int
+    steps: list[dict[str, Any]], shortlist: list[str], count: int,
+    ranker: bool,
 ) -> list[str]:
-    """Show the keyword shortlist, then how the name was written."""
-    if len(shortlist) == count:
-        kept = f"kept all {count} functions"
+    """Show which functions the model chose from, then how it wrote it."""
+    if not ranker:
+        kept = f"keyword ranker off: the model chooses from all {count}"
+    elif len(shortlist) == count:
+        kept = f"keyword ranker kept all {count} functions"
     else:
-        kept = f"kept {len(shortlist)} of {count}: {', '.join(shortlist)}"
+        kept = (
+            f"keyword ranker kept {len(shortlist)} of {count}: "
+            f"{', '.join(shortlist)}"
+        )
     lines = textwrap.wrap(
-        f"2. Function name  (keyword ranker {kept})",
+        f"2. Function name  ({kept})",
         width=_WIDTH,
         subsequent_indent="   ",
     )
@@ -79,7 +85,8 @@ def render_generation(
                        subsequent_indent="   "),
         "",
         *_name_lines([s for s in steps if s["field"] == "name"],
-                     trace["shortlist"], trace["function_count"]),
+                     trace["shortlist"], trace["function_count"],
+                     trace["ranker"]),
         "",
         *_argument_lines(parameters),
         "",

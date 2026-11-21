@@ -10,8 +10,11 @@ run-model:
 trace:
 	uv run python -m src --trace
 
-trace-choices:
-	uv run python -m src --trace --input data/input/model_choice_tests.json --output data/output/model_choice_results.json
+run-ranker:
+	uv run python -m src --ranker
+
+trace-ranker:
+	uv run python -m src --trace --ranker
 
 export-vocabulary:
 	uv run python good_to_have/export_vocabulary.py

@@ -4,6 +4,19 @@ _This project has been created as part of the 42 curriculum by hhulic._
 
 ## Description
 
+
+The model sees:
+
+```bash
+<|im_start|>system
+You call functions. Pick the one function ...
+<|im_end|>
+<|im_start|>user
+What is the sum of 2 and 3?
+<|im_end|>
+```
+
+
 This project turns natural-language requests into structured function calls.
 Given a request such as "What is the sum of 2 and 3?" and a JSON file that
 defines the available functions, it outputs the function to call and its
@@ -17,13 +30,15 @@ arguments with the correct types:
 }
 ```
 
-A keyword ranker first shortlists the functions whose words and domain best
-match the request. A small language model (`Qwen/Qwen3-0.6B` by default) then
-chooses among them with **constrained decoding**: it writes the function name
-one token at a time, and only tokens that continue a shortlisted name are
-allowed. The arguments are read from the request with regular expressions,
-according to each parameter's type. The model is reached only through the
-provided `llm_sdk`, and text is encoded by the project's own tokenizer.
+A small language model (`Qwen/Qwen3-0.6B` by default) chooses the function
+with **constrained decoding**: it writes the function name one token at a
+time, and only tokens that continue a real function name are allowed. An
+optional keyword ranker (`--ranker`, off by default) can first shortlist the
+functions whose words and domain best match the request, so that the model
+chooses among fewer. The arguments are read from the request with regular
+expressions, according to each parameter's type. The model is reached only
+through the provided `llm_sdk`, and text is encoded by the project's own
+tokenizer.
 
 ## Instructions
 
@@ -61,6 +76,11 @@ Options:
 - `--trace` shows how each function was chosen, step by step (see
   [Generation visualization](#generation-visualization)). Also `make trace`.
 - `--model <alias or repo id>` selects another model (see below).
+- `--ranker` turns on the keyword ranker, which shortlists the functions
+  before the model chooses (see
+  [Shortlisting](#shortlisting-keyword-ranking-optional)). Without it, the
+  model chooses among all the functions. Also `make run-ranker` and
+  `make trace-ranker`.
 
 ### Example usage
 
@@ -133,6 +153,8 @@ such as TinyLlama are rejected with a clear error.
 | `make install`      | install dependencies with `uv sync`           |
 | `make run`          | run the pipeline on the default files         |
 | `make trace`        | run with the step-by-step visualization       |
+| `make run-ranker`   | run with the keyword ranker on                |
+| `make trace-ranker` | trace with the keyword ranker on              |
 | `make run-model`    | run with `MODEL=<alias>`                      |
 | `make debug`        | run under `pdb`                               |
 | `make lint`         | `flake8 .` and `mypy` with the required flags |
@@ -142,7 +164,10 @@ such as TinyLlama are rejected with a clear error.
 
 ## Algorithm
 
-### Shortlisting: keyword ranking
+### Shortlisting: keyword ranking (optional)
+
+Off by default; `--ranker` turns it on. Without it, every function is a
+candidate and the model makes the choice.
 
 `keyword_ranker.shortlist_functions` scores every function against the
 request: shared words count, shared terms from five domain vocabularies
@@ -153,10 +178,10 @@ if nothing scores, all of them are kept.
 
 ### Choosing the function: constrained decoding
 
-The prompt lists the shortlisted functions as
-`name(param: type, ...): description` and ends with `{"name": "`. The model
+The prompt lists the candidate functions as `name: description` and ends
+with `{"name": "`. The model
 then writes the function name one token at a time, but it may only write a
-shortlisted name:
+candidate's name:
 
 - Each name, with its closing quote, is encoded into a token sequence.
   Together the sequences form a trie.
@@ -167,13 +192,14 @@ shortlisted name:
   appended **without calling the model**. Calling the model could not change
   the result, because every other token is masked out.
 
-When several functions are kept, the model makes the choice: for the sample
-names every name starts with `fn` (fast-forward), the model chooses once
-between the next tokens (`_add`, `_g`, `_reverse`, ...), and the rest of the
-name is fast-forwarded again. When the ranker keeps a single function, every
-token is fast-forwarded and the model is not called. The closing quote makes
-every sequence end differently, even when one name starts another (`fn_read`
-and `fn_read_file`).
+With several candidates, the model makes the choice: for the sample names
+every name starts with `fn` (fast-forward), the model chooses once between
+the next tokens (`_add`, `_g`, `_reverse`, ...), and the rest of the name is
+fast-forwarded again. So without the ranker, choosing among all 12 functions
+takes exactly one model call. When the ranker is on and keeps a single
+function, every token is fast-forwarded and the model is not called. The
+closing quote makes every sequence end differently, even when one name starts
+another (`fn_read` and `fn_read_file`).
 
 ### Extracting the arguments: regular expressions
 
@@ -204,9 +230,9 @@ functions), the model receives exactly this:
 You call functions. Pick the one function whose description matches what the user asks for, and reply with the call as JSON.
 
 Functions:
-- fn_add_numbers(a: number, b: number): Add two numbers together and return their sum.
-- fn_greet(name: string): Generate a greeting message for a person by name.
-- fn_reverse_string(s: string): Reverse a string and return the reversed result.<|im_end|>
+- fn_add_numbers: Add two numbers together and return their sum.
+- fn_greet: Generate a greeting message for a person by name.
+- fn_reverse_string: Reverse a string and return the reversed result.<|im_end|>
 <|im_start|>user
 Say hi to Alice<|im_end|>
 <|im_start|>assistant
@@ -279,14 +305,14 @@ still valid and decode to the same text.
 ## Generation visualization
 
 `--trace` (or `make trace`) prints how each function was chosen instead of the
-timing JSON. When the ranker keeps several functions, the model decides:
+timing JSON. By default the model chooses among all the functions:
 
 ```text
 PROMPT: Say hi to Alice
 1. Tokenization  (4 tokens)
    ['Say', ' hi', ' to', ' Alice']
 
-2. Function name  (keyword ranker kept all 12 functions)
+2. Function name  (keyword ranker off: the model chooses from all 12)
    'fn'           fast-forward
    12 allowed tokens, one model call:
    ► '_g'           fn_greet                       p= 99.9%  ████████████████████████
@@ -306,7 +332,8 @@ PROMPT: Say hi to Alice
    1 model calls, 3 fast-forward tokens
 ```
 
-When it keeps one, every token of the name is fast-forwarded:
+With `--ranker` (or `make trace-ranker`), when the ranker keeps one function,
+every token of the name is fast-forwarded:
 
 ```text
 PROMPT: Read the file at /home/user/data.json with utf-8 encoding
@@ -326,18 +353,26 @@ PROMPT: Read the file at /home/user/data.json with utf-8 encoding
 ```
 
 It shows how encoding and decoding work together with constrained decoding:
-`encode` turns the prompt and every shortlisted name into tokens (the trie),
+`encode` turns the prompt and every candidate name into tokens (the trie),
 and `decode` turns the allowed tokens back into text for the trace, with the
 probability the model gave each one. The trace is recorded only when
 `--trace` is given.
 
 ## Design decisions
 
-- **Keyword shortlist, then the model.** The ranker narrows the functions
-  down by words and domain; the model chooses among what is left, and can
-  only write a real name. A version without the shortlist let the model
-  choose among all functions on every prompt; it chose the same functions on
-  the test sets, with one model call per prompt.
+- **The model chooses; the keyword shortlist is optional.** The subject asks
+  for the function to be chosen by the LLM, not by heuristics, so by default
+  the model chooses among all the functions and can only write a real name.
+  The keyword ranker (`--ranker`) can narrow the functions down by words and
+  domain first. On the 22 sample prompts both give the same 22 calls: with
+  the ranker the model is never called (0.26 s), without it the model is
+  called once per prompt (31 s).
+- **Short function lines.** The model sees `name: description`, without the
+  parameter list: each call costs roughly in proportion to the prompt
+  length, and the model only chooses the name. On 32 prompts this was 20%
+  faster than `name(a: number, b: number): description`, with the same 32
+  right choices. The descriptions stay, because they are what lets the model
+  match "plus" to "Add two numbers".
 - **Regular expressions for the arguments.** Reading values from the request
   with regex needs no model call. A version that also decoded every argument
   with constrained decoding (see the git history) reached 20 of 22 full calls
@@ -361,9 +396,11 @@ Measured on the cluster CPU with `Qwen/Qwen3-0.6B`:
 | Sample prompts (22)                            | 22/22    | 17/22     |
 | Reworded prompts, edge cases, unseen functions | -        | 16/22     |
 
-- **Function choice** is right for every sample prompt. For all 22 the
-  ranker keeps a single function, so the model is not called; on the second
-  set it kept several functions for 6 prompts and the model chose.
+- **Function choice** is right for every sample prompt, with and without
+  the ranker. By default the model chooses among all 12 functions, with one
+  model call per prompt. With `--ranker`, the ranker keeps a single function
+  for all 22, so the model is not called; on the second set it kept several
+  functions for 6 prompts and the model chose.
 - **Arguments:** 17 of 22 sample calls are fully right (77%), below the
   subject's 90% target. The misses are `database` read as `"database"`
   instead of `production` / `system` (2), `replacement` read as
@@ -373,8 +410,10 @@ Measured on the cluster CPU with `Qwen/Qwen3-0.6B`:
   instead), `José` loses its accent, and three prompts are skipped because a
   value is missing or not a whole number ("What is the sum of 7?", "Is 4.5 an
   even number?", "Is the statement 'the sky is green' true?").
-- **Speed:** under a second for the 22 sample prompts (no model call), and
-  0.7 to 5 s for a prompt where the model chooses. Start-up adds about 34 s:
+- **Speed:** 31 s for the 22 sample prompts by default (one model call each,
+  about 1.4 s per prompt), and 0.26 s with `--ranker` (no model call). Times
+  vary with other load on the machine. Start-up
+  adds about 34 s:
   24 s to import torch and transformers, 9 s to load the model and 1 s to
   build the tokenizer.
 - **Reliability:** every output is valid JSON with exactly the required keys.
@@ -420,7 +459,7 @@ Measured on the cluster CPU with `Qwen/Qwen3-0.6B`:
 ```text
 src/__main__.py      Command line, per-prompt error recovery
 src/client.py        Function choice (constrained decoding) and regex arguments
-src/keyword_ranker.py  Keyword and domain ranking that shortlists functions
+src/keyword_ranker.py  Optional keyword and domain shortlist (--ranker)
 src/tokenizer.py     Own byte-level BPE tokenizer (encode / decode)
 src/schema.py        Pydantic models for definitions and calls
 src/visualize.py     --trace rendering
@@ -486,3 +525,37 @@ Step	Tensor	What happens
 2e	mlp: gate_proj, up_proj, down_proj	Expand each vector to 3072 numbers, apply a nonlinear function (SiLU), and shrink it back to 1024. Each token is processed on its own; much of the "facts" learned in training is stored here.
 layers.1 to layers.27	Repeat 2a to 2e with that layer's own tables, 28 times in total.
 3	model.norm, then lm_head [151936, 1024]	Rescale the last token's final vector, then multiply it with every row: 151,936 results, which are the logits _pick gets.
+
+
+
+
+About 25 steps in total. You've done 7, so 18 are left. Here's the map, in four parts:
+
+Part A: setup, once per run (steps 1-8)
+1-7 ✓ command → main() → args → functions → prompts → model name → model → tokenizer
+8. the router object is created (Pydantic checks llm)
+
+Part B: the loop starts (steps 9-10)
+9. process_prompts takes item 1 and checks it's {"prompt": "..."}
+10. generate_call starts and resets the trace counters
+
+Part C: the heart, one prompt "Give me 10 plus 20" (steps 11-21)
+11. the keyword ranker scores all 12 functions ✓
+12. the shortlist: which names survive✓
+13. candidates, the FunctionSchema objects for those names✓
+14. chat() builds the token ids of the context✓
+15. _choose_text splits the names into tokens
+16. round 1: fn is fast-forwarded✓
+17. round 2: the model call: logits → mask → argmax
+18. the last rounds: fast-forward, then the name is returned
+19. the name is matched back to its FunctionSchema
+20. extract_arguments: regex finds a = 10.0, b = 20.0
+21. the trace and the FunctionCall are built and returned
+
+Part D: output and finish (steps 22-25)
+22. render_generation prints the trace block
+23. the result is added to the list, and the other 9 prompts go through the same steps 9-22
+24. write_results writes the JSON file
+25. the summary line, return 0 → SystemExit(0)
+
+Part C (steps 11-21) is the part most worth taking slowly. It's the actual function calling, and evaluators will mostly ask about it. Parts B and D are short.

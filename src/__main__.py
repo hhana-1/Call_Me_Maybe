@@ -6,9 +6,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from src.client import TokenAwareConstrainedRouter, load_functions
+from src.client import TokenAwareConstrainedRouter
 from llm_sdk.llm_sdk import Small_LLM_Model
 from src.models import DEFAULT_MODEL, MODEL_PRESETS, resolve_model
+from src.schema import FunctionSchema
 from src.tokenizer import BPETokenizer
 from src.visualize import render_generation
 
@@ -41,7 +42,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Visualize each prompt's generation pipeline step by step.",
     )
+    parser.add_argument(
+        "--ranker",
+        action="store_true",
+        help=(
+            "Shortlist the functions with the keyword ranker before the "
+            "model chooses. Off by default: the model chooses among all."
+        ),
+    )
     return parser.parse_args()
+
+
+def load_functions(path: str) -> list[FunctionSchema]:
+    """Load and validate function definitions from JSON."""
+    with open(path, encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, list):
+        raise ValueError("Function definitions must be a JSON array")
+    return [FunctionSchema.model_validate(item) for item in raw]
 
 
 def load_prompts(path: str) -> list[Any]:
@@ -118,6 +136,7 @@ def main() -> int:
             llm=model,
             tokenizer=BPETokenizer.from_model(model),
             trace_enabled=args.trace,
+            use_ranker=args.ranker,
         )
         started = time.perf_counter()
         results, skipped = process_prompts(
