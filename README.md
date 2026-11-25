@@ -45,12 +45,12 @@ Using model: Qwen/Qwen3-0.6B
       "b": 3
     }
   },
-  "started_at": "02:41:29",
-  "finished_at": "02:41:31",
-  "time passed": 0.047
+  "started_at": "00:30:48",
+  "finished_at": "00:30:50",
+  "time passed": 0.037
 }
 ...
-Wrote 22 call(s) to data/output/function_calling_results.json in 111.42 seconds.
+Wrote 11 call(s) to data/output/function_calling_results.json in 56.13 seconds.
 ```
 
 A prompt that cannot be processed is reported and skipped, and the results
@@ -93,11 +93,10 @@ The result goes into a Pydantic `FunctionCall` and is written with `json.dump`.
 
 ## Design decisions
 
-- **The model chooses, not keywords.** The keyword ranker (`--ranker`) is a bonus part I added for fun ad a flag, not a core of the program, since it performs really well in small controlled environment
-- **The model writes the arguments.** I first did it with regex and it was superfast
-  (29 s) but got only 17 of 22 calls right. When the model chooses like now, it gets 21 of 22.
+- **The model chooses, not keywords.** The keyword ranker (`--ranker`) is a bonus part I added for fun as a flag, not a core of the program, since it performs really well in small controlled environment
+- **The model writes the arguments.** I first did it with regex and it was superfast but got less parameters correctly
 - **Fewer model calls.** Values are copied from the request, so most tokens
-  are fast-forwarded (163 s became about 112 s), and both prompts are short:
+  are fast-forwarded, and both prompts are short:
   no parameters in the name prompt, one function in the argument prompt.
 - **The SDK's tokenizer**, through `encode` and `decode`; `tokenizer.py` only
   adapts it (lists instead of tensors, all tokens, the chat markers).
@@ -106,14 +105,15 @@ The result goes into a Pydantic `FunctionCall` and is written with `json.dump`.
 
 ## Performance analysis
 
-Measured on the cluster CPU with `Qwen/Qwen3-0.6B`, on the 22 sample prompts:
+Measured on the cluster CPU with `Qwen/Qwen3-0.6B`, on the 11 sample prompts
+and 5 functions:
 
 | Measure | Result |
 | ------- | ------ |
-| right function | 22/22 |
-| fully right call | **21/22** (the miss: regex `\d+\s` instead of `\d+`) |
-| valid JSON | 22/22 |
-| time | about 112 s for 132 model calls, plus about 34 s start-up |
+| right function | 11/11 |
+| fully right call | **10/11** (the miss: regex `\d+\s` instead of `\d+`) |
+| valid JSON | 11/11 |
+| time | about 58 s for 72 model calls, plus about 34 s start-up |
 
 - **Speed:** a model call costs about 0.3 s plus 5 ms per prompt token, since
   the SDK keeps no cache. "Give me 10 plus 20" needs 3 calls for 15 tokens.
@@ -123,24 +123,12 @@ Measured on the cluster CPU with `Qwen/Qwen3-0.6B`, on the 22 sample prompts:
 
 ## Challenges faced
 
-- **Time without a cache.** Every call rereads the whole prompt. Solved with
-  fast-forwarding, copying from the request and shorter prompts.
-- **Tokens, not characters.** When the code wrote the opening quote, the model
-  dropped the `/` of a path and the `-` of `-4`. Letting the model choose the
-  token (` "/`, ` -`) fixed both.
-- **JSON strings.** A free string must never break the JSON: tokens with `"`
-  or `\` are checked at every step, all others are sorted out once.
-- **Integers.** "4.5" for an integer once became 45. Now an integer is chosen
-  among the whole numbers, and a decimal is refused.
+- **Deciding what is constrained decoding and what is heuristic** Sometimes the fastest executing solution wasn't relying on LLM choice (even though it was correct). Fixed that by adding it as a bonus flag so program doesn't really rely on it but it is there to strike a discussion amongst peers. 
 
 ## Testing strategy
 
-- A scoring script compares the 22 sample outputs with the expected calls.
-- Edge cases: negative and decimal numbers, accents, empty strings, Windows
-  paths, missing values, a function file the code has never seen.
-- Errors: missing or invalid JSON files, items without `"prompt"`,
-  unsupported parameter types, an unknown model name.
-- `--trace` to check every step by hand; `make lint` and `make lint-strict`.
+- Scoring script
+- Trial and error
 
 # Resources
 
@@ -152,4 +140,4 @@ Measured on the cluster CPU with `Qwen/Qwen3-0.6B`, on the 22 sample prompts:
 - Pydantic documentation: <https://docs.pydantic.dev>
 
 **AI use.** Claude was used to explain LLM concepts (tokens, logits,
-masking), to help measure constrained decoding, fix flake8 and mypy errors, and to draft this README
+masking), to measure performance, to help measure constrained decoding, fix flake8 and mypy errors, and to draft this README

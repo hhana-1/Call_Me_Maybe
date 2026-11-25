@@ -13,9 +13,6 @@ trace:
 run-ranker:
 	uv run python -m src --ranker
 
-trace-ranker:
-	uv run python -m src --trace --ranker
-
 export-vocabulary:
 	uv run python good_to_have/export_vocabulary.py
 

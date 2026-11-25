@@ -1,19 +1,4 @@
 """Choose the function and write its arguments with constrained decoding.
-
-1. **Shortlist, keyword ranking** (optional, off by default):
-   ``keyword_ranker.shortlist_functions`` scores every function by shared
-   words and domains and keeps the best. When it is off, every function is a
-   candidate.
-2. **Function name, constrained decoding**: the prompt lists the candidate
-   functions and the model writes the name one token at a time. Only tokens
-   that continue a candidate's name are allowed: every other logit is set to
-   minus infinity. When just one token is allowed it is fast-forwarded:
-   added without calling the model.
-3. **Arguments, constrained decoding**: the model continues the same JSON,
-   ``"parameters": {...}``. The code writes the keys and punctuation from the
-   schema; the model writes each value, limited by the parameter's type.
-   This step is in ``arguments.py`` (``ArgumentWriter``, the router's base
-   class).
 """
 
 from typing import Any, Sequence

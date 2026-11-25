@@ -148,7 +148,7 @@ class ArgumentWriter(BaseModel):
         written: list[int],
         labels: dict[str, str],
     ) -> str:
-        """Continue writing one of ``sequences`` from ``written``."""
+        """Continue writing one of seq from the tokens ``written``."""
 
     # ----- the arguments ---------------------------------------------------
 
