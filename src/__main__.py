@@ -10,7 +10,7 @@ from src.client import TokenAwareConstrainedRouter
 from llm_sdk.llm_sdk import Small_LLM_Model
 from src.models import DEFAULT_MODEL, MODEL_PRESETS, resolve_model
 from src.schema import FunctionSchema
-from src.tokenizer import BPETokenizer
+from src.tokenizer import SDKTokenizer
 from src.visualize import render_generation
 
 
@@ -48,14 +48,6 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Shortlist the functions with the keyword ranker before the "
             "model chooses. Off by default: the model chooses among all."
-        ),
-    )
-    parser.add_argument(
-        "--regex-arguments",
-        action="store_true",
-        help=(
-            "Read the arguments from the prompt with regular expressions. "
-            "Off by default: the model writes them."
         ),
     )
     return parser.parse_args()
@@ -142,10 +134,9 @@ def main() -> int:
         model = Small_LLM_Model(model_name=model_name)
         router = TokenAwareConstrainedRouter(
             llm=model,
-            tokenizer=BPETokenizer.from_model(model),
+            tokenizer=SDKTokenizer.from_model(model),
             trace_enabled=args.trace,
             use_ranker=args.ranker,
-            regex_arguments=args.regex_arguments,
         )
         started = time.perf_counter()
         results, skipped = process_prompts(

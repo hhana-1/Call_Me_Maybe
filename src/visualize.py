@@ -58,18 +58,14 @@ def _call_lines(step: dict[str, Any], indent: str, limit: int) -> list[str]:
 
 
 def _argument_lines(
-    parameters: dict[str, Any], steps: list[dict[str, Any]], by: str
+    parameters: dict[str, Any], steps: list[dict[str, Any]]
 ) -> list[str]:
     """List the arguments with their Python types, and how each was written.
 
     Consecutive fast-forward tokens are shown together on one line.
     """
-    if by == "regex":
-        lines = ["3. Arguments  (read from the prompt with regular "
-                 "expressions)"]
-    else:
-        lines = ["3. Arguments  (written by the model; each parameter's "
-                 "type limits the tokens)"]
+    lines = ["3. Arguments  (written by the model; each parameter's "
+             "type limits the tokens)"]
     if not parameters:
         lines.append("   (no parameters)")
     for key, value in parameters.items():
@@ -118,7 +114,7 @@ def render_generation(
                      trace["shortlist"], trace["function_count"],
                      trace["ranker"]),
         "",
-        *_argument_lines(parameters, steps, trace["arguments_by"]),
+        *_argument_lines(parameters, steps),
         "",
         "4. Result",
         f"   {trace['selected']} "

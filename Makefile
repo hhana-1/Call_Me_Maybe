@@ -16,12 +16,6 @@ run-ranker:
 trace-ranker:
 	uv run python -m src --trace --ranker
 
-run-regex:
-	uv run python -m src --regex-arguments
-
-regex-arg-ranker:
-	uv run python -m src --ranker --regex-arguments
-
 export-vocabulary:
 	uv run python good_to_have/export_vocabulary.py
 
