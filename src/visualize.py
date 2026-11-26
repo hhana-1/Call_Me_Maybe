@@ -57,33 +57,13 @@ def _call_lines(step: dict[str, Any], indent: str, limit: int) -> list[str]:
     return lines
 
 
-def _argument_lines(
-    parameters: dict[str, Any], steps: list[dict[str, Any]]
-) -> list[str]:
-    """List the arguments with their Python types, and how each was written.
-
-    Consecutive fast-forward tokens are shown together on one line.
-    """
-    lines = ["3. Arguments  (written by the model; each parameter's "
-             "type limits the tokens)"]
+def _argument_lines(parameters: dict[str, Any]) -> list[str]:
+    """List the arguments with their Python types."""
+    lines = ["3. Arguments  (read with regular expressions, no model)"]
     if not parameters:
         lines.append("   (no parameters)")
     for key, value in parameters.items():
         lines.append(f"   {key} = {value!r}  ({type(value).__name__})")
-        forwarded: list[str] = []
-        for step in [s for s in steps if s["argument"] == key] + [None]:
-            if step is not None and step["fast_forward"]:
-                forwarded.append(step["text"])
-                continue
-            if forwarded:
-                count = len(forwarded)
-                lines.append(
-                    f"      {''.join(forwarded)!r} fast-forward"
-                    f" ({count} token{'' if count == 1 else 's'})"
-                )
-                forwarded = []
-            if step is not None:
-                lines.extend(_call_lines(step, "      ", 3))
     return lines
 
 
@@ -110,11 +90,10 @@ def render_generation(
         *textwrap.wrap(repr(tokens), width=_WIDTH, initial_indent="   ",
                        subsequent_indent="   "),
         "",
-        *_name_lines([s for s in steps if s["argument"] is None],
-                     trace["shortlist"], trace["function_count"],
+        *_name_lines(steps, trace["shortlist"], trace["function_count"],
                      trace["ranker"]),
         "",
-        *_argument_lines(parameters, steps),
+        *_argument_lines(parameters),
         "",
         "4. Result",
         f"   {trace['selected']} "

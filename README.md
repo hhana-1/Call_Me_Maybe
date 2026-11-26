@@ -9,10 +9,12 @@ request and a JSON file of function definitions, it writes the function to
 call and its arguments with the right types: "What is the sum of 2 and 3?"
 becomes `fn_add_numbers` with `{"a": 2, "b": 3}`.
 
-A small model (`Qwen/Qwen3-0.6B`) writes the whole call with **constrained
+A small model (`Qwen/Qwen3-0.6B`) chooses the function with **constrained
 decoding**: at every step the code decides which tokens are allowed, and the
-model only chooses among them, so every output is valid JSON that matches the
-schema. The model is reached only through the public methods of `llm_sdk`.
+model only chooses among them, so it can only write a real function name.
+Regular expressions then read the arguments from the request, by the types in
+the function definition. Every output is valid JSON that matches the schema.
+The model is reached only through the public methods of `llm_sdk`.
 
 # Instructions
 
@@ -28,7 +30,7 @@ change them with `--functions_definition`, `--input` and `--output`.
 | Option | Make target | Effect |
 | ------ | ----------- | ------ |
 | `--trace` | `make trace` | show every decoding step |
-| `--ranker` | `make run-ranker` | shortlist the functions with a keyword ranker first (off by default) |
+| `--ranker` | `make run-ranker` | shortlist the functions with a keyword ranker first; when it keeps one, the model is not called (off by default) |
 | `--model <alias>` | `make run-model MODEL=<alias>` | `qwen3-0.6b` (default), `qwen2.5-0.5b`, `smollm2-360m`, `smollm2-135m`, or a repo id |
 
 ## Example usage
@@ -45,12 +47,12 @@ Using model: Qwen/Qwen3-0.6B
       "b": 3
     }
   },
-  "started_at": "00:30:48",
-  "finished_at": "00:30:50",
-  "time passed": 0.037
+  "started_at": "01:29:11",
+  "finished_at": "01:29:12",
+  "time passed": 0.017
 }
 ...
-Wrote 11 call(s) to data/output/function_calling_results.json in 56.13 seconds.
+Wrote 11 call(s) to data/output/function_calling_results.json in 10.23 seconds.
 ```
 
 A prompt that cannot be processed is reported and skipped, and the results
@@ -79,47 +81,59 @@ tokens (`fn` `_add` `_numbers` `"`), and together they form a trie. `_follow`
 allows only the next tokens of the names that still match. All names start
 with `fn`, so the model makes one choice (`_add`, `_g`...) per name.
 
-**4. The arguments.** A second prompt shows only the chosen function with its
-parameter types. The code writes the keys and punctuation; the model writes
-each value, limited by its type:
+**4. The arguments.** `regex_arguments.py` reads each value from the request
+with regular expressions, by the parameter's type, with no model call:
 
-| Type | Allowed |
+| Type | Read as |
 | ---- | ------- |
-| `number`, `integer` | one of the numbers in the request; written digit by digit if there is none |
-| `boolean` | ` true` or ` false` |
-| `string` | a piece of the request (copied, so only its end is a real choice), or free text where only tokens that keep the JSON valid are allowed |
+| `number`, `integer` | the numbers of the request, in order (an integer must be whole) |
+| `boolean` | a `true` / `false` in the request, or the answer to an even/odd question |
+| `string` | a pattern for some parameter names (`regex`, `replacement`, `source_string`, `path`, `encoding`), else the quoted texts in order, else the last word |
 
 The result goes into a Pydantic `FunctionCall` and is written with `json.dump`.
 
 ## Design decisions
 
 - **The model chooses, not keywords.** The keyword ranker (`--ranker`) is a bonus part I added for fun as a flag, not a core of the program, since it performs really well in small controlled environment
-- **The model writes the arguments.** I first did it with regex and it was superfast but got less parameters correctly
-- **Fewer model calls.** Values are copied from the request, so most tokens
-  are fast-forwarded, and both prompts are short:
-  no parameters in the name prompt, one function in the argument prompt.
+- **Regular expressions read the arguments.** Letting the model write them
+  with constrained decoding also got 10 of 11 calls right, but needed 57
+  model calls (about 43 s); the regular expressions need none (about 10 s
+  in all).
+- **Short prompt.** The function list leaves out the parameters, so every
+  model call is cheaper.
 - **The SDK's tokenizer**, through `encode` and `decode`; `tokenizer.py` only
-  adapts it (lists instead of tensors, all tokens, the chat markers).
-- **Code split:** `client.py` chooses the name, `arguments.py` writes the
-  arguments, `tokenizer.py` holds the tokenizer and `chat()`.
+  adapts it (lists instead of tensors, the chat markers).
+- **Code split:** `client.py` chooses the name, `regex_arguments.py` reads
+  the arguments, `tokenizer.py` holds the tokenizer and `chat()`.
 
 ## Performance analysis
 
 Measured on the cluster CPU with `Qwen/Qwen3-0.6B`, on the 11 sample prompts
 and 5 functions:
 
-| Measure | Result |
-| ------- | ------ |
-| right function | 11/11 |
-| fully right call | **10/11** (the miss: regex `\d+\s` instead of `\d+`) |
-| valid JSON | 11/11 |
-| time | about 58 s for 72 model calls, plus about 34 s start-up |
+| Measure | `make run` | `make run-ranker` |
+| ------- | ---------- | ----------------- |
+| right function | 11/11 | 11/11 |
+| fully right call | **10/11** | **10/11** |
+| valid JSON | 11/11 | 11/11 |
+| model calls | 11 | 0 |
+| time | about 10 s | 0.02 s |
+
+Both modes give the same 11 calls; the miss is the replacement `asterisks`
+instead of `*`. The ranker keeps 1 of the 5 functions for every prompt, so
+`make run-ranker` needs no model call. Start-up adds about 34 s in both modes.
+
+On the earlier set of 22 prompts and 12 functions the regular expressions get
+17/22 right (77%): they read `database` instead of `production` / `system`,
+`asterisks` instead of `*`, and only one word of the two templates. The
+rules are written for these kinds of requests, so new wordings fail more
+easily than the function choice.
 
 - **Speed:** a model call costs about 0.3 s plus 5 ms per prompt token, since
-  the SDK keeps no cache. "Give me 10 plus 20" needs 3 calls for 15 tokens.
-- **Reliability:** the mask makes every output valid, not always correct. The
-  model invents values the request lacks ("sum of 7" gives 7 and 7), and a
-  number word next to digits fails ("Add ten and 5" gives 5 and 5).
+  the SDK keeps no cache. Each prompt needs one call, for the function name.
+- **Reliability:** the function name is always a real one. A missing value
+  stops only that prompt: "What is the sum of 7?" is skipped with
+  `Missing number argument: b`.
 
 ## Challenges faced
 
@@ -140,4 +154,4 @@ and 5 functions:
 - Pydantic documentation: <https://docs.pydantic.dev>
 
 **AI use.** Claude was used to explain LLM concepts (tokens, logits,
-masking), to measure performance, to help measure constrained decoding, fix flake8 and mypy errors, and to draft this README
+masking), to measure performance, to measure constrained decoding, fix flake8 and mypy errors, help with regex, and to draft this README

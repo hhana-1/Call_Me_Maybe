@@ -23,9 +23,19 @@ clean:
 	find . -type d \( -name __pycache__ -o -name .mypy_cache \) -prune -exec rm -rf {} +
 
 lint:
-	uv run flake8 .
-	uv run mypy . --warn-return-any --warn-unused-ignores --ignore-missing-imports --disallow-untyped-defs --check-untyped-defs
-
+	uv run flake8 --exclude=.venv,llm_sdk
+	uv run mypy . \
+		--warn-return-any \
+		--warn-unused-ignores \
+		--ignore-missing-imports \
+		--disallow-untyped-defs \
+		--check-untyped-defs \
+		--explicit-package-bases \
+		--exclude '^(venv|\.venv|env|llm_sdk)/'
+		
 lint-strict:
-	uv run flake8 .
-	uv run mypy . --strict
+	uv run flake8 --exclude=.venv,llm_sdk
+	uv run mypy . \
+		--strict \
+		--explicit-package-bases \
+		--exclude '^(venv|\.venv|env|llm_sdk)/'

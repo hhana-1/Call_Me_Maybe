@@ -1,16 +1,16 @@
-"""Choose the function and write its arguments with constrained decoding.
+"""Choose the function with constrained decoding; read its arguments with
+regular expressions (``regex_arguments.py``).
 """
 
 from typing import Any, Sequence
 
 import numpy as np
-import numpy.typing as npt
-from pydantic import ConfigDict, PrivateAttr, field_validator
+from pydantic import BaseModel, ConfigDict, PrivateAttr, field_validator
 
-from src.arguments import ArgumentWriter
 from src.keyword_ranker import shortlist_functions
+from src.regex_arguments import extract_arguments
 from src.schema import FunctionCall, FunctionSchema
-from src.tokenizer import chat
+from src.tokenizer import SDKTokenizer, chat
 
 PICK_FUNCTION = (
     "You call functions. Pick the one function whose description matches "
@@ -27,21 +27,23 @@ def describe(function: FunctionSchema) -> str:
     return f"- {function.name}: {function.description}"
 
 
-class TokenAwareConstrainedRouter(ArgumentWriter):
-    """Write function calls with constrained decoding: name and arguments.
+class TokenAwareConstrainedRouter(BaseModel):
+    """Choose the function with constrained decoding, then read its arguments.
 
     Attributes:
         llm: The SDK model; only ``get_logits_from_input_ids`` is used.
-        tokenizer: The SDK's tokenizer (declared in ``ArgumentWriter``).
+        tokenizer: The SDK's tokenizer.
         trace_enabled: Record every decoding step in ``last_trace``.
         use_ranker: Shortlist the functions with the keyword ranker before
-            the model chooses. Off by default: the model chooses among all.
+            the model chooses; when it keeps one, the model is not called.
+            Off by default: the model chooses among all.
         last_trace: Steps of the latest call, when tracing is enabled.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     llm: Any
+    tokenizer: SDKTokenizer
     trace_enabled: bool = False
     use_ranker: bool = False
     last_trace: dict[str, Any] | None = None
@@ -69,7 +71,7 @@ class TokenAwareConstrainedRouter(ArgumentWriter):
         """
         if not functions:
             raise ValueError("No function definitions were provided")
-        self._steps, self._calls, self._argument = [], 0, None
+        self._steps, self._calls = [], 0
 
         if self.use_ranker:
             # The keyword ranker shortlists the functions with the best score.
@@ -95,7 +97,8 @@ class TokenAwareConstrainedRouter(ArgumentWriter):
         )
         name = self._choose_text(context, [f'{f.name}"' for f in candidates])
         function = next(f for f in candidates if f'{f.name}"' == name)
-        parameters = self.write_arguments(prompt, function)
+        # Regular expressions read the arguments, with no model call.
+        parameters = extract_arguments(prompt, function)
 
         if self.trace_enabled:
             self.last_trace = {
@@ -171,14 +174,14 @@ class TokenAwareConstrainedRouter(ArgumentWriter):
     def _pick(
         self,
         context: list[int],
-        allowed: Sequence[int] | npt.NDArray[np.int64],
+        allowed: Sequence[int],
         labels: dict[int, str],
     ) -> int:
         """Add the best allowed token to ``context`` and return it.
 
         Args:
             context: Token ids so far (prompt plus output); extended here.
-            allowed: The ids allowed at this step (a list or a NumPy array).
+            allowed: The ids allowed at this step.
             labels: What allowed tokens stand for, shown in the trace.
         """
         if len(allowed) == 1:  # fast-forward: no need to ask the model
@@ -216,9 +219,6 @@ class TokenAwareConstrainedRouter(ArgumentWriter):
         return token
 
     def _record(self, step: dict[str, Any]) -> None:
-        """Remember a step for the trace.
-
-        ``argument`` is the parameter being written, or None for the name.
-        """
+        """Remember a step for the trace."""
         if self.trace_enabled:
-            self._steps.append({"argument": self._argument, **step})
+            self._steps.append(step)
